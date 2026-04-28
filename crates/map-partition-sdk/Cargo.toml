@@ -1,0 +1,11 @@
+[package]
+name = "map-partition-sdk"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "SDK for developing MapPartition .so processors for Ballista"
+
+[dependencies]
+arrow = { version = "54" }
+arrow-ipc = { version = "54" }
+paste = "1"

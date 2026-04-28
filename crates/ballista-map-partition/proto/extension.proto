@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package extension.ballista;
+
+import "datafusion_common.proto";
+
+//
+// message naming convention
+//
+// prefix L means logical
+// prefix P means physical
+//
+
+//
+// Logical Plan Extensions
+//
+
+message LMessage {
+    oneof Extension {
+        LMapPartition map_partition = 1;
+    }
+}
+
+message LMapPartition {
+    string so_path = 1;
+    string fn_name = 2;
+    bytes output_schema = 3;
+}
+
+//
+// Physical Plan Extensions
+//
+
+message PMessage {
+    oneof Extension {
+        bytes opaque = 1;
+        PMapPartition map_partition = 2;
+    }
+}
+
+message PMapPartition {
+    string so_path = 1;
+    string fn_name = 2;
+    bytes output_schema = 3;
+}

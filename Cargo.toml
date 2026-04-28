@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/ballista-map-partition",
+    "crates/map-partition-sdk",
+    "crates/map-partition-sdk/examples/identity_processor",
+]
+resolver = "3"
