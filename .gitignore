@@ -1,2 +1,3 @@
-/target
-data/
+# 测试数据（仅保留 data/test.parquet，忽略其他生成的数据文件）
+data/*
+!data/test.parquet

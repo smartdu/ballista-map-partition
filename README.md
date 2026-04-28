@@ -347,6 +347,8 @@ MAP_PARTITION_SO=/path/to/libidentity_processor.so \
 
 ## 运行测试
 
+### 单元测试 & 单机示例
+
 ```bash
 # 单元测试 & plan round-trip 测试
 cargo test -p ballista-map-partition
@@ -358,4 +360,76 @@ cargo build --release
 # 运行 DataFusion 单机示例
 MAP_PARTITION_SO=/path/to/libidentity_processor.so \
   cargo run --example datafusion
+```
+
+### 分布式计算测试（S3 + MapPartition）
+
+前置条件：Docker、MinIO 镜像。
+
+**1. 构建 .so 处理器**
+
+```bash
+cd crates/map-partition-sdk/examples/identity_processor
+cargo build --release
+# 产出：target/release/libidentity_processor.so
+```
+
+**2. 启动 MinIO**
+
+```bash
+docker run --rm -d -p 9000:9000 -p 9001:9001 \
+  --name minio \
+  -e "MINIO_ACCESS_KEY=MINIO" -e "MINIO_SECRET_KEY=MINIOSECRET" \
+  quay.io/minio/minio server /data --console-address ":9001"
+```
+
+**3. 上传测试数据到 S3**
+
+```bash
+pip install minio
+python3 -c "
+from minio import Minio
+client = Minio('localhost:9000', access_key='MINIO', secret_key='MINIOSECRET', secure=False)
+if not client.bucket_exists('ballista'):
+    client.make_bucket('ballista')
+client.fput_object('ballista', 'data/test.parquet', 'data/test.parquet')
+print('Uploaded data/test.parquet to s3://ballista/data/')
+"
+```
+
+**4. 启动 Scheduler**（新终端）
+
+```bash
+cargo run --example distributed_compute_scheduler
+```
+
+**5. 启动 Executor**（新终端）
+
+```bash
+cargo run --example distributed_compute_executor
+```
+
+**6. 运行 Client**
+
+```bash
+MAP_PARTITION_SO=target/release/libidentity_processor.so \
+  cargo run --example distributed_compute_client
+```
+
+预期输出：
+
+```
++---+---+
+| a | b |
++---+---+
+| 1 | x |
+| 2 | y |
+| 3 | z |
++---+---+
+```
+
+**7. 清理**
+
+```bash
+docker stop minio
 ```
