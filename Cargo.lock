@@ -2482,6 +2482,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "face_cluster_processor"
+version = "0.1.0"
+dependencies = [
+ "arrow 54.3.1",
+ "map-partition-sdk",
+ "paste",
+]
+
+[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

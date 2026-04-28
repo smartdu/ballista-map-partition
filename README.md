@@ -61,7 +61,8 @@ ballista-map-partition/
 │       │   ├── ipc.rs                  # Arrow IPC 编解码
 │       │   └── export.rs               # export_partition_processor! 宏
 │       └── examples/
-│           └── identity_processor/     # 示例 .so (透传处理器)
+│           ├── identity_processor/     # 示例 .so (透传处理器)
+│           └── face_cluster_processor/ # 示例 .so (人脸聚类处理器)
 ```
 
 ## 六层扩展管线
@@ -336,6 +337,99 @@ MAP_PARTITION_SO=/path/to/libidentity_processor.so \
 
 详细设计文档参见 [docs/design.md](docs/design.md)。
 
+### 5. 人脸聚类示例（S3 + MapPartition 分布式计算）
+
+项目提供了一个人脸抓拍聚类端到端示例，演示 **输入输出 Schema 不同** 的场景：
+
+- **输入**：人脸抓拍数据 `(channelid, captime, recordid)`
+- **输出**：档案聚类结果 `(dossierid, clusterids)`，按 channelid 分组合并 recordid
+
+| 文件 | 说明 |
+|------|------|
+| `face_cluster_processor/` | `.so` 处理器：按 channelid 分组，生成 dossierid → clusterids 映射 |
+| `face_cluster_client.rs` | 分布式客户端：从 S3 读取人脸抓拍数据，经 map_partition 输出聚类结果 |
+| `data/face_capture/` | 测试数据（Parquet 格式） |
+
+**运行步骤**：
+
+1. 构建 face_cluster_processor `.so`：
+
+```bash
+cargo build --release -p face_cluster_processor
+```
+
+2. 启动 MinIO（如已启动可跳过）：
+
+```bash
+docker run --rm -d -p 9000:9000 -p 9001:9001 \
+  --name minio \
+  -e "MINIO_ACCESS_KEY=MINIO" -e "MINIO_SECRET_KEY=MINIOSECRET" \
+  quay.io/minio/minio server /data --console-address ":9001"
+```
+
+3. 上传人脸抓拍测试数据到 S3：
+
+```bash
+pip install minio
+python3 -c "
+from minio import Minio
+client = Minio('localhost:9000', access_key='MINIO', secret_key='MINIOSECRET', secure=False)
+if not client.bucket_exists('ballista'):
+    client.make_bucket('ballista')
+client.fput_object('ballista', 'face_capture/face_capture.parquet', 'data/face_capture/face_capture.parquet')
+print('Uploaded to s3://ballista/face_capture/')
+"
+```
+
+4. 启动 Scheduler（新终端）：
+
+```bash
+cargo run --example distributed_compute_scheduler
+```
+
+5. 启动 Executor（新终端）：
+
+```bash
+cargo run --example distributed_compute_executor
+```
+
+6. 运行人脸聚类客户端：
+
+```bash
+MAP_PARTITION_SO=target/release/libface_cluster_processor.so \
+  cargo run --example face_cluster_client
+```
+
+预期输出：
+
+```
+--- Input: face capture data ---
++-----------+---------------------+----------+
+| channelid | captime             | recordid |
++-----------+---------------------+----------+
+| ch001     | 2026-01-01 08:00:00 | rec001   |
+| ch001     | 2026-01-01 08:05:00 | rec002   |
+| ch001     | 2026-01-01 09:00:00 | rec003   |
+| ch002     | 2026-01-01 08:10:00 | rec004   |
+| ch002     | 2026-01-01 08:30:00 | rec005   |
+| ch003     | 2026-01-01 10:00:00 | rec006   |
++-----------+---------------------+----------+
+--- Output: dossier clustering ---
++---------------+----------------------+
+| dossierid     | clusterids           |
++---------------+----------------------+
+| dossier_ch001 | rec001,rec002,rec003 |
+| dossier_ch002 | rec004,rec005        |
+| dossier_ch003 | rec006               |
++---------------+----------------------+
+```
+
+**要点**：
+
+- 输出 Schema 由客户端定义（`dossierid + clusterids`），与输入 Schema 不同
+- `face_cluster_processor` 使用 `arrow::compute::cast` 处理 DataFusion 的 `Utf8View` 列类型
+- Scheduler 和 Executor 复用 `distributed_compute_scheduler` / `distributed_compute_executor`
+
 ## 版本兼容
 
 | 依赖 | 版本 |
@@ -366,11 +460,12 @@ MAP_PARTITION_SO=/path/to/libidentity_processor.so \
 
 前置条件：Docker、MinIO 镜像。
 
+#### 透传处理器（identity_processor）
+
 **1. 构建 .so 处理器**
 
 ```bash
-cd crates/map-partition-sdk/examples/identity_processor
-cargo build --release
+cargo build --release -p identity_processor
 # 产出：target/release/libidentity_processor.so
 ```
 
@@ -428,7 +523,36 @@ MAP_PARTITION_SO=target/release/libidentity_processor.so \
 +---+---+
 ```
 
-**7. 清理**
+#### 人脸聚类处理器（face_cluster_processor）
+
+**1. 构建 .so 处理器**
+
+```bash
+cargo build --release -p face_cluster_processor
+# 产出：target/release/libface_cluster_processor.so
+```
+
+**2. 上传人脸抓拍测试数据到 S3**（MinIO 已启动）
+
+```bash
+python3 -c "
+from minio import Minio
+client = Minio('localhost:9000', access_key='MINIO', secret_key='MINIOSECRET', secure=False)
+client.fput_object('ballista', 'face_capture/face_capture.parquet', 'data/face_capture/face_capture.parquet')
+print('Uploaded to s3://ballista/face_capture/')
+"
+```
+
+**3. 启动 Scheduler / Executor**（如已启动可复用）
+
+**4. 运行人脸聚类 Client**
+
+```bash
+MAP_PARTITION_SO=target/release/libface_cluster_processor.so \
+  cargo run --example face_cluster_client
+```
+
+**5. 清理**
 
 ```bash
 docker stop minio
