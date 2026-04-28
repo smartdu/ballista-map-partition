@@ -347,7 +347,7 @@ MAP_PARTITION_SO=/path/to/libidentity_processor.so \
 | 文件 | 说明 |
 |------|------|
 | `face_cluster_processor/` | `.so` 处理器：按 channelid 分组，生成 dossierid → clusterids 映射 |
-| `face_cluster_client.rs` | 分布式客户端：从 S3 读取人脸抓拍数据，经 map_partition 输出聚类结果 |
+| `face_cluster_client.rs` | 分布式客户端：从 S3 读取人脸抓拍数据，经 map_partition 输出聚类结果并写回 S3 |
 | `data/face_capture/` | 测试数据（Parquet 格式） |
 
 **运行步骤**：
@@ -422,9 +422,8 @@ MAP_PARTITION_SO=target/release/libface_cluster_processor.so \
 | dossier_ch002 | rec004,rec005        |
 | dossier_ch003 | rec006               |
 +---------------+----------------------+
-```
-
-**要点**：
+--- Results written to s3://ballista/face_cluster_result/ ---
+```**要点**：
 
 - 输出 Schema 由客户端定义（`dossierid + clusterids`），与输入 Schema 不同
 - `face_cluster_processor` 使用 `arrow::compute::cast` 处理 DataFusion 的 `Utf8View` 列类型
@@ -551,6 +550,8 @@ print('Uploaded to s3://ballista/face_capture/')
 MAP_PARTITION_SO=target/release/libface_cluster_processor.so \
   cargo run --example face_cluster_client
 ```
+
+聚类结果会写回 `s3://ballista/face_cluster_result/`，可通过 MinIO 控制台（http://localhost:9001）查看。
 
 **5. 清理**
 

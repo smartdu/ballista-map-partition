@@ -94,7 +94,12 @@ async fn main() -> datafusion::common::Result<()> {
     let df = df.map_partition(&so_path, "face_cluster_processor", output_schema)?;
 
     println!("--- Output: dossier clustering ---");
-    df.show().await?;
+    df.clone().show().await?;
+
+    // 将聚类结果写回 S3
+    let output_path = format!("s3://{S3_BUCKET}/face_cluster_result/");
+    df.write_parquet(&output_path, Default::default(), None).await?;
+    println!("--- Results written to {} ---", output_path);
 
     Ok(())
 }

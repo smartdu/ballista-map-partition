@@ -113,6 +113,22 @@ impl LogicalExtensionCodec for ExtendedBallistaLogicalCodec {
     ) -> datafusion::error::Result<()> {
         self.inner.try_encode_table_provider(table_ref, node, buf)
     }
+
+    fn try_decode_file_format(
+        &self,
+        buf: &[u8],
+        ctx: &TaskContext,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::datasource::file_format::FileFormatFactory>> {
+        self.inner.try_decode_file_format(buf, ctx)
+    }
+
+    fn try_encode_file_format(
+        &self,
+        buf: &mut Vec<u8>,
+        node: Arc<dyn datafusion::datasource::file_format::FileFormatFactory>,
+    ) -> datafusion::error::Result<()> {
+        self.inner.try_encode_file_format(buf, node)
+    }
 }
 
 #[derive(Debug, Default)]
