@@ -315,18 +315,18 @@ docker run --rm -p 9000:9000 -p 9001:9001 \
 
 2. 启动 Scheduler：
 ```bash
-cargo run --example distributed_compute_scheduler
+cargo run --release --example distributed_compute_scheduler
 ```
 
 3. 启动 Executor：
 ```bash
-cargo run --example distributed_compute_executor
+cargo run --release --example distributed_compute_executor
 ```
 
 4. 运行 Client：
 ```bash
 MAP_PARTITION_SO=/path/to/libidentity_processor.so \
-  cargo run --example distributed_compute_client
+  cargo run --release --example distributed_compute_client
 ```
 
 **集成要点**：
@@ -384,20 +384,20 @@ print('Uploaded to s3://ballista/face_capture/')
 4. 启动 Scheduler（新终端）：
 
 ```bash
-cargo run --example distributed_compute_scheduler
+cargo run --release --example distributed_compute_scheduler
 ```
 
 5. 启动 Executor（新终端）：
 
 ```bash
-cargo run --example distributed_compute_executor
+cargo run --release --example distributed_compute_executor
 ```
 
 6. 运行人脸聚类客户端：
 
 ```bash
 MAP_PARTITION_SO=target/release/libface_cluster_processor.so \
-  cargo run --example face_cluster_client
+  cargo run --release --example face_cluster_client
 ```
 
 预期输出：
@@ -452,7 +452,7 @@ cargo build --release
 
 # 运行 DataFusion 单机示例
 MAP_PARTITION_SO=/path/to/libidentity_processor.so \
-  cargo run --example datafusion
+  cargo run --release --example datafusion
 ```
 
 ### 分布式计算测试（S3 + MapPartition）
@@ -494,20 +494,20 @@ print('Uploaded data/test.parquet to s3://ballista/data/')
 **4. 启动 Scheduler**（新终端）
 
 ```bash
-cargo run --example distributed_compute_scheduler
+cargo run --release --example distributed_compute_scheduler
 ```
 
 **5. 启动 Executor**（新终端）
 
 ```bash
-cargo run --example distributed_compute_executor
+cargo run --release --example distributed_compute_executor
 ```
 
 **6. 运行 Client**
 
 ```bash
 MAP_PARTITION_SO=target/release/libidentity_processor.so \
-  cargo run --example distributed_compute_client
+  cargo run --release --example distributed_compute_client
 ```
 
 预期输出：
@@ -548,7 +548,7 @@ print('Uploaded to s3://ballista/face_capture/')
 
 ```bash
 MAP_PARTITION_SO=target/release/libface_cluster_processor.so \
-  cargo run --example face_cluster_client
+  cargo run --release --example face_cluster_client
 ```
 
 聚类结果会写回 `s3://ballista/face_cluster_result/`，可通过 MinIO 控制台（http://localhost:9001）查看。
