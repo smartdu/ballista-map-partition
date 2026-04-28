@@ -293,6 +293,49 @@ let config = BallistaConfig::builder()
 // .so 文件需预先部署到 Executor 节点的对应路径
 ```
 
+### 4. S3 + MapPartition 分布式计算
+
+项目提供了集成 **S3 对象存储** 和 **map_partition 算子** 的分布式计算示例，可从 S3 读取数据并经 `.so` 处理器处理后输出。
+
+| 示例文件 | 说明 |
+|----------|------|
+| `distributed_compute_scheduler.rs` | Scheduler：S3 会话配置 + MapPartition 编解码器 + QueryPlanner |
+| `distributed_compute_executor.rs` | Executor：S3 运行时 + MapPartition 编解码器 |
+| `distributed_compute_client.rs` | Client：S3 数据源 + MapPartition 算子 |
+
+**启动步骤**：
+
+1. 启动 MinIO（本地 S3 兼容存储）：
+```bash
+docker run --rm -p 9000:9000 -p 9001:9001 \
+  -e "MINIO_ACCESS_KEY=MINIO" -e "MINIO_SECRET_KEY=MINIOSECRET" \
+  quay.io/minio/minio server /data --console-address ":9001"
+```
+
+2. 启动 Scheduler：
+```bash
+cargo run --example distributed_compute_scheduler
+```
+
+3. 启动 Executor：
+```bash
+cargo run --example distributed_compute_executor
+```
+
+4. 运行 Client：
+```bash
+MAP_PARTITION_SO=/path/to/libidentity_processor.so \
+  cargo run --example distributed_compute_client
+```
+
+**集成要点**：
+
+- Scheduler 通过 `combined_session_builder` 同时注入 S3 会话状态和 `QueryPlannerWithExtensions`
+- Executor 通过 `session_config_with_s3_support` + `runtime_env_with_s3_support` 获得 S3 访问能力
+- Client 通过 `state_with_s3_support()` 创建会话，再叠加 MapPartition 编解码器，使用 `SET` 语句配置 S3 参数
+
+详细设计文档参见 [docs/design.md](docs/design.md)。
+
 ## 版本兼容
 
 | 依赖 | 版本 |
