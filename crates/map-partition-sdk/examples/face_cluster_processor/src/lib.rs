@@ -116,6 +116,8 @@ impl PartitionProcessor for FaceClusterProcessor {
                 .expect("failed to create output batch"),
         )
     }
+
+    fn finish(&mut self) {}
 }
 
 export_partition_processor!(FaceClusterProcessor, face_cluster_processor);

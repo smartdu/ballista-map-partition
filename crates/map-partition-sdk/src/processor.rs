@@ -8,6 +8,7 @@ use arrow::record_batch::RecordBatch;
 /// 2. `feed(batch)` — called multiple times, streaming input
 /// 3. `execute()` — called once after all input is fed
 /// 4. `fetch()` — called multiple times, streaming output
+/// 5. `finish()` — called once to release resources
 ///
 /// The framework releases each input batch after `feed()` returns.
 /// If you need to retain data, clone it or store it in your struct.
@@ -27,4 +28,9 @@ pub trait PartitionProcessor: Send + Sized + 'static {
     /// Stream output data. Called repeatedly until `None` is returned.
     /// Return `Some(batch)` for each output batch, `None` when done.
     fn fetch(&mut self) -> Option<RecordBatch>;
+
+    /// Called once after all output has been fetched.
+    /// Use this to release any external resources created in `new()`.
+    /// The framework drops the processor after this returns.
+    fn finish(&mut self) {}
 }

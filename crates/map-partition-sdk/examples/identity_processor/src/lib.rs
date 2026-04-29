@@ -33,6 +33,8 @@ impl PartitionProcessor for IdentityProcessor {
             None
         }
     }
+
+    fn finish(&mut self) {}
 }
 
 export_partition_processor!(IdentityProcessor, identity_processor);

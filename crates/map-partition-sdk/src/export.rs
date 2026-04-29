@@ -110,6 +110,8 @@ macro_rules! export_partition_processor {
             pub extern "C" fn [<$fn_name _finish>](
                 ctx: *mut std::ffi::c_void,
             ) -> i32 {
+                let processor = unsafe { &mut *(ctx as *mut $processor_type) };
+                processor.finish();
                 unsafe { drop(Box::from_raw(ctx as *mut $processor_type)) };
                 0
             }
