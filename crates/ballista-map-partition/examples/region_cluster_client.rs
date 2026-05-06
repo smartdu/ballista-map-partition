@@ -24,10 +24,10 @@ const NUM_PARTITIONS: usize = 100;
 /// 输入：人脸抓拍数据 (region, channelid, captime, recordid)
 /// 输出：聚类结果 (region, dossierid, recordids)
 ///
-/// 与 face_cluster_client 的区别：
-///   1. 输入多了 region 字段
+/// 特性：
+///   1. 输入含 region 字段
 ///   2. 使用 with_distribute_by 按 region 分区，确保同 region 数据在同一 processor
-///   3. map_partition 里的 processor 不再按 channelid 分组，而是随机聚类
+///   3. processor 内部按相同 channelid 聚类，生成 dossier
 ///   4. processor 内部检测是否出现混合 region（验证 distribute_by 正确性）
 ///
 /// 启动顺序：

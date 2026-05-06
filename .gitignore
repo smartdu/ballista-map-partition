@@ -2,3 +2,4 @@
 data/*
 !data/test.parquet
 !data/face_capture/
+target/
