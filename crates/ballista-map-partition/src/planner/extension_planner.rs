@@ -5,9 +5,9 @@ use datafusion::common::DataFusionError;
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::physical_expr::create_physical_expr;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-
 use crate::logical::map_partition::MapPartition;
 use crate::physical::map_partition_exec::MapPartitionExec;
 
@@ -52,14 +52,17 @@ impl ExtensionPlanner for CustomPlannerExtension {
         &self,
         _planner: &dyn PhysicalPlanner,
         node: &dyn UserDefinedLogicalNode,
-        _logical_inputs: &[&LogicalPlan],
+        logical_inputs: &[&LogicalPlan],
         physical_inputs: &[Arc<dyn ExecutionPlan>],
-        _session_state: &SessionState,
+        session_state: &SessionState,
     ) -> datafusion::error::Result<Option<Arc<dyn ExecutionPlan>>> {
         if let Some(MapPartition {
             so_path,
             fn_name,
             output_schema,
+            distribute_by,
+            num_partitions,
+            hash_partition,
             ..
         }) = node.as_any().downcast_ref::<MapPartition>()
         {
@@ -74,11 +77,56 @@ impl ExtensionPlanner for CustomPlannerExtension {
             let arrow_schema: datafusion::arrow::datatypes::Schema =
                 output_schema.as_arrow().clone();
 
+            let input_df_schema = logical_inputs
+                .first()
+                .ok_or(DataFusionError::Plan(
+                    "MapPartition expects single logical input".to_string(),
+                ))?
+                .schema();
+
+            // Convert distribute_by logical expr to physical expr
+            let distribute_by_phys = match distribute_by {
+                Some(expr) => Some(create_physical_expr(
+                    expr,
+                    &input_df_schema,
+                    session_state.execution_props(),
+                )?),
+                None => None,
+            };
+
+            let num_partitions = num_partitions.unwrap_or(0);
+
+            // Derive hash_partition_phys from distribute_by_phys (they use the same expression)
+            // Also check the logical hash_partition as a fallback
+            let hash_partition_phys = if distribute_by_phys.is_some() && num_partitions > 0 {
+                Some((vec![distribute_by_phys.clone().unwrap()], num_partitions))
+            } else {
+                match hash_partition {
+                    Some((exprs, count)) => {
+                        let phys_exprs: Vec<Arc<dyn datafusion::physical_expr::PhysicalExpr>> = exprs
+                            .iter()
+                            .map(|e| {
+                                create_physical_expr(
+                                    e,
+                                    &input_df_schema,
+                                    session_state.execution_props(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        Some((phys_exprs, *count))
+                    }
+                    None => None,
+                }
+            };
+
             let exec = MapPartitionExec::new(
                 so_path.clone(),
                 fn_name.clone(),
                 Arc::new(arrow_schema),
                 input,
+                distribute_by_phys,
+                num_partitions,
+                hash_partition_phys,
             );
             let node = Arc::new(exec);
 

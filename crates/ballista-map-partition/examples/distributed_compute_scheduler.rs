@@ -11,6 +11,7 @@ use ballista_scheduler::scheduler_process::start_server;
 use ballista_map_partition::codec::extension::{
     ExtendedBallistaLogicalCodec, ExtendedBallistaPhysicalCodec,
 };
+use ballista_map_partition::physical_optimizer::EnforceDistributeBy;
 use ballista_map_partition::planner::extension_planner::QueryPlannerWithExtensions;
 use datafusion::execution::{SessionState, SessionStateBuilder};
 
@@ -45,7 +46,7 @@ async fn main() -> ballista_core::error::Result<()> {
     Ok(())
 }
 
-/// 组合 S3 支持与 MapPartition QueryPlanner 的 session builder
+/// 组合 S3 支持与 MapPartition QueryPlanner + EnforceDistributeBy 优化规则的 session builder
 fn combined_session_builder(
     config: datafusion::prelude::SessionConfig,
 ) -> datafusion::error::Result<SessionState> {
@@ -53,5 +54,6 @@ fn combined_session_builder(
     let query_planner = Arc::new(QueryPlannerWithExtensions::default());
     Ok(SessionStateBuilder::new_from_existing(state)
         .with_query_planner(query_planner)
+        .with_physical_optimizer_rule(Arc::new(EnforceDistributeBy))
         .build())
 }

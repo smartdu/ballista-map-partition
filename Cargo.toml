@@ -4,5 +4,6 @@ members = [
     "crates/map-partition-sdk",
     "crates/map-partition-sdk/examples/identity_processor",
     "crates/map-partition-sdk/examples/face_cluster_processor",
+    "crates/map-partition-sdk/examples/region_cluster_processor",
 ]
 resolver = "3"

@@ -16,6 +16,7 @@ ballista-core = { version = "52" }
 datafusion = { version = "52" }
 datafusion-proto = { version = "52" }
 datafusion-proto-common = { version = "52" }
+datafusion-physical-optimizer = { version = "52" }
 
 futures = { version = "0.3" }
 futures-util = { version = "0.3" }

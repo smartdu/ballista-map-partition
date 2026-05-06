@@ -50,6 +50,7 @@ ballista-map-partition/
 │   │   ├── src/
 │   │   │   ├── logical/                # 逻辑算子 (MapPartition)
 │   │   │   ├── physical/               # 物理算子 (MapPartitionExec)
+│   │   │   ├── physical_optimizer/      # 物理优化规则 (EnforceDistributeBy)
 │   │   │   ├── dataframe/              # DataFrame 扩展 (DataFrameExt)
 │   │   │   ├── planner/                # 扩展查询规划器
 │   │   │   └── codec/                  # Ballista 序列化编解码器
@@ -62,7 +63,8 @@ ballista-map-partition/
 │       │   └── export.rs               # export_partition_processor! 宏
 │       └── examples/
 │           ├── identity_processor/     # 示例 .so (透传处理器)
-│           └── face_cluster_processor/ # 示例 .so (人脸聚类处理器)
+│           ├── face_cluster_processor/ # 示例 .so (人脸聚类处理器)
+│           └── region_cluster_processor/ # 示例 .so (按 Region 分区+按 channelid 聚类处理器)
 ```
 
 ## 六层扩展管线
@@ -73,10 +75,11 @@ ballista-map-partition/
 |------|------|------|
 | 1. Proto | `extension.proto` | 定义 `LMapPartition` / `PMapPartition` 消息 |
 | 2. Logical Node | `logical/map_partition.rs` | `UserDefinedLogicalNodeCore` 实现 |
-| 3. DataFrame Ext | `dataframe/map_partition.rs` | `DataFrameExt::map_partition()` API |
-| 4. Physical Node | `physical/map_partition_exec.rs` | `ExecutionPlan` 实现，含五阶段 `.so` 调用 |
+| 3. DataFrame Ext | `dataframe/map_partition.rs` | `DataFrameExt::map_partition()` + `with_distribute_by()` API |
+| 4. Physical Node | `physical/map_partition_exec.rs` | `ExecutionPlan` 实现，含五阶段 `.so` 调用 + 内部 grouping |
 | 5. Extension Planner | `planner/extension_planner.rs` | `QueryPlannerWithExtensions` 逻辑→物理转换 |
 | 6. Codec | `codec/extension.rs` | `ExtendedBallistaLogicalCodec` / `ExtendedBallistaPhysicalCodec` |
+| 7. Physical Optimizer | `physical_optimizer/enforce_distribute_by.rs` | `EnforceDistributeBy` 自定义优化规则，强制插入 RepartitionExec |
 
 ### 编解码器装饰器模式
 
@@ -131,6 +134,65 @@ int32_t <fn_name>_fetch(void* ctx, uint8_t** output_ptr, int64_t* output_len);
 
 // 结束：释放处理器上下文
 int32_t <fn_name>_finish(void* ctx);
+```
+
+## DistributeBy 分区语义
+
+### API
+
+```rust
+df.map_partition(&so_path, "processor", output_schema)?
+  .with_distribute_by(col("region"), 100)?   // 按 region 分区，100 个分区
+  .build()?;
+```
+
+`with_distribute_by(expr, num_partitions)` 的语义：**相同值进入同一个 processor，不同值进入不同 processor**。
+
+- `expr`：按哪个列分区
+- `num_partitions`：分区数（应 >= 该列的不同值数量，确保每个值大概率独占一个分区）
+
+### 三层保障
+
+| 层 | 机制 | 作用 |
+|---|---|---|
+| **1. 强制 RepartitionExec** | `EnforceDistributeBy` 自定义 PhysicalOptimizerRule | 在 scheduler 端物理优化阶段，强制在 MapPartitionExec 前插入 RepartitionExec，确保多分区并行 |
+| **2. 内部 grouping** | MapPartitionExec execute() 内部按 key 分组 | 兜底——同一分区内 hash 碰撞的数据仍按值隔离，保证 100% 正确性 |
+| **3. required_input_distribution** | 声明 HashPartitioned 需求 | 辅助优化器做正确决策 |
+
+### 三级并行模型
+
+```
+级别 1：跨 executor 并行
+  └─ Ballista 调度器把 N 个分区分配到多个 executor，各 executor 同时运行
+
+级别 2：executor 内跨分区并行
+  └─ 每个 executor 的线程池（concurrent_tasks）并行执行分配到的多个分区
+
+级别 3：分区内串行
+  └─ 若同分区有多个不同值（hash 碰撞），内部多个 processor 串行执行
+```
+
+| 级别 | 控制参数 | 设置方式 |
+|------|---------|---------|
+| 级别1：跨 executor | executor 数量 | 启动多个 executor 进程 |
+| 级别2：executor 内跨分区 | `concurrent_tasks`（默认=CPU核数） | `--concurrent-tasks` 启动参数 |
+| 级别3：分区内串行 | 无需配置 | 代码逻辑保证 |
+
+### Scheduler 配置
+
+Scheduler 需注册 `EnforceDistributeBy` 优化规则：
+
+```rust
+use ballista_map_partition::physical_optimizer::EnforceDistributeBy;
+
+fn combined_session_builder(config: SessionConfig) -> Result<SessionState> {
+    let state = session_state_with_s3_support(config)?;
+    let query_planner = Arc::new(QueryPlannerWithExtensions::default());
+    Ok(SessionStateBuilder::new_from_existing(state)
+        .with_query_planner(query_planner)
+        .with_physical_optimizer_rule(Arc::new(EnforceDistributeBy))
+        .build())
+}
 ```
 
 ## Schema 处理策略
@@ -347,8 +409,11 @@ MAP_PARTITION_SO=/path/to/libidentity_processor.so \
 | 文件 | 说明 |
 |------|------|
 | `face_cluster_processor/` | `.so` 处理器：按 channelid 分组，生成 dossierid → clusterids 映射 |
+| `region_cluster_processor/` | `.so` 处理器：按随机值聚类，检测跨 region 分区错误 |
 | `face_cluster_client.rs` | 分布式客户端：从 S3 读取人脸抓拍数据，经 map_partition 输出聚类结果并写回 S3 |
+| `region_cluster_client.rs` | 分布式客户端：按 region Hash repartition 后聚类，验证不同 region 走不同分区 |
 | `data/face_capture/` | 测试数据（Parquet 格式） |
+| `data/region_face_capture/` | 测试数据（Parquet 格式，含 region 字段） |
 
 **运行步骤**：
 
@@ -552,6 +617,76 @@ MAP_PARTITION_SO=target/release/libface_cluster_processor.so \
 ```
 
 聚类结果会写回 `s3://ballista/face_cluster_result/`，可通过 MinIO 控制台（http://localhost:9001）查看。
+
+聚类结果会写回 `s3://ballista/face_cluster_result/`，可通过 MinIO 控制台（http://localhost:9001）查看。
+
+#### Region 聚类处理器（region_cluster_processor）
+
+演示 **DistributeBy 分区 + map_partition** 的场景：先按 `region` 字段做 DistributeBy 分区，确保相同 region 进入同一个 processor，再在分区内按相同 channelid 进行聚类。
+
+- **输入**：含 region 的人脸抓拍数据 `(region, channelid, captime, recordid)`
+- **输出**：聚类结果 `(region, dossierid, recordids)`，按 channelid 聚类
+- **分区验证**：`.so` 处理器内部检测是否出现混合 region，若检测到则输出 `CROSS_REGION_ERROR`
+
+**1. 构建 .so 处理器**
+
+```bash
+cargo build --release -p region_cluster_processor
+# 产出：target/release/libregion_cluster_processor.so
+```
+
+**2. 上传含 region 的测试数据到 S3**（MinIO 已启动）
+
+```bash
+python3 -c "
+from minio import Minio
+client = Minio('localhost:9000', access_key='MINIO', secret_key='MINIOSECRET', secure=False)
+client.fput_object('ballista', 'region_face_capture/region_face_capture.parquet', 'data/region_face_capture/region_face_capture.parquet')
+print('Uploaded to s3://ballista/region_face_capture/')
+"
+```
+
+**3. 启动 Scheduler / Executor**（如已启动可复用）
+
+**4. 运行 Region 聚类 Client**
+
+```bash
+MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
+  cargo run --release --example region_cluster_client
+```
+
+预期输出（无 `CROSS_REGION_ERROR` 表示分区正确，相同 channelid 的记录聚类到同一 dossier）：
+
+```
+--- Input: region face capture data ---
++--------+-----------+---------------------+----------+
+| region | channelid | captime             | recordid |
++--------+-----------+---------------------+----------+
+| east   | ch001     | 2026-01-01 08:00:00 | rec001   |
+| east   | ch001     | 2026-01-01 08:05:00 | rec002   |
+| east   | ch002     | 2026-01-01 08:10:00 | rec003   |
+| west   | ch003     | 2026-01-01 09:00:00 | rec004   |
+| west   | ch003     | 2026-01-01 09:30:00 | rec005   |
+| north  | ch004     | 2026-01-01 10:00:00 | rec006   |
++--------+-----------+---------------------+----------+
+--- Output: region cluster result ---
++--------+---------------+---------------+
+| region | dossierid     | recordids     |
++--------+---------------+---------------+
+| west   | dossier_ch003 | rec004,rec005 |
+| east   | dossier_ch001 | rec001,rec002 |
+| east   | dossier_ch002 | rec003        |
+| north  | dossier_ch004 | rec006        |
++--------+---------------+---------------+
+--- Results written to s3://ballista/region_cluster_result/ ---
+```
+
+**要点**：
+
+- 使用 `with_distribute_by(col("region"), 100)` 声明按 region 做 DistributeBy 分区
+- 自定义 `EnforceDistributeBy` 优化规则在 Scheduler 端强制插入 `RepartitionExec`，确保小数据集也能正确分区
+- `region_cluster_processor` 在分区内按 channelid 聚类：相同 channelid 的记录归入同一个 dossier
+- 若输出中出现 `CROSS_REGION_ERROR` 行，说明 DistributeBy 分区未生效
 
 **5. 清理**
 

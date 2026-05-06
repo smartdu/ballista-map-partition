@@ -38,7 +38,7 @@ async fn main() -> datafusion::common::Result<()> {
         .unwrap_or_else(|_| "../../map-partition-sdk/examples/identity_processor/target/release/libidentity_processor.so".to_string());
 
     let output_schema = df.schema().as_arrow().clone();
-    let df = df.map_partition(&so_path, "identity_processor", Arc::new(output_schema))?;
+    let df = df.map_partition(&so_path, "identity_processor", Arc::new(output_schema))?.build()?;
 
     df.show().await?;
 

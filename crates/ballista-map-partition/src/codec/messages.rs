@@ -20,6 +20,14 @@ pub struct LMapPartition {
     pub fn_name: ::prost::alloc::string::String,
     #[prost(bytes = "vec", tag = "3")]
     pub output_schema: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub hash_partition_exprs: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "5")]
+    pub hash_partition_count: u64,
+    #[prost(bytes = "vec", tag = "6")]
+    pub distribute_by_expr: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "7")]
+    pub num_partitions: u64,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PMessage {
@@ -44,4 +52,12 @@ pub struct PMapPartition {
     pub fn_name: ::prost::alloc::string::String,
     #[prost(bytes = "vec", tag = "3")]
     pub output_schema: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub hash_partition_exprs: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "5")]
+    pub hash_partition_count: u64,
+    #[prost(bytes = "vec", tag = "6")]
+    pub distribute_by_expr: ::prost::alloc::vec::Vec<u8>,
+    #[prost(uint64, tag = "7")]
+    pub num_partitions: u64,
 }
