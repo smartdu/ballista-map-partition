@@ -349,13 +349,13 @@ cargo run --release --example distributed_compute_executor --features monitoring
 | **集群组件** | `distributed_compute_scheduler` | Scheduler：S3 + MapPartition codec + EnforceDistributeBy |
 | | `distributed_compute_executor` | Executor：S3 + MapPartition codec，支持命令行参数 |
 | **客户端** | `region_cluster_client` | DistributeBy + region_cluster_processor 功能验证 |
-| | `bench_region_cluster_client` | 500W 条数据 + 50 Region 并发性能基准测试，结果写回 S3 |
+| | `bench_region_cluster_client` | 并发性能基准测试，支持参数化 Region 数和 JSON 大小，结果写回 S3 |
 
 ### .so 处理器
 
 | 处理器 | 说明 |
 |--------|------|
-| `region_cluster_processor` | 按 channelid 聚类生成 dossier，检测 CROSS_REGION_ERROR |
+| `region_cluster_processor` | 按 channelid 聚类生成 dossier，从轨迹中随机采样 json1-4，检测 CROSS_REGION_ERROR |
 
 ---
 
@@ -433,20 +433,25 @@ MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
 
 **数据集参数**：
 
-| 参数 | 值 |
-|------|-----|
-| 总记录数 | 5,000,000 |
-| Region 数 | 50 |
-| 每 Region channelid 数 | 100（即 100 个档案） |
-| 每 channelid 轨迹数 | 1,000 |
-| 分区数 | 50 |
-| 预期档案数 | 5,000（50 × 100） |
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| Region 数 | 1 | `-r` 参数指定 |
+| 每 Region channelid 数 | 100 | 即 100 个档案 |
+| 每 channelid 轨迹数 | 1,000 | |
+| JSON 大小 | 1KB | `-j` 参数指定（最小 32 字节） |
+| 分区数 | max(regions, 50) | 自动计算 |
+
+示例：`-r 50 -j 4096` 生成 50 × 100 × 1000 = 5,000,000 行，每行含 4KB json。
+
+**输入 Schema**：`(region, channelid, captime, recordid, json)`
+
+**输出 Schema**：`(region, dossierid, recordids, json1, json2, json3, json4)`，其中 json1-4 从该档案的轨迹中均匀采样。
 
 **流程**：
-1. 生成 5,000,000 条测试数据（内存构建 Arrow RecordBatch）
+1. 生成测试数据（内存构建 Arrow RecordBatch）
 2. 清理 S3 旧数据，写入 `s3://ballista/bench_region_face_capture/`
 3. 通过 Ballista 读取 S3 数据，执行 DistributeBy + map_partition 聚类
-4. 聚类结果由 Executor 端直接写入 `s3://ballista/bench_region_cluster_result/`（不经过客户端）
+4. 聚类结果由 Executor 端直接写入 `s3://ballista/bench_region_cluster_result/`
 5. 读回结果验证正确性（档案数、CROSS_REGION_ERROR 检测）
 
 **启动步骤**：
@@ -464,9 +469,21 @@ cargo run --release --example distributed_compute_executor -- -p 50051 --bind-gr
 cargo run --release --example distributed_compute_executor -- -p 50053 --bind-grpc-port 50054 -c 4 &
 
 # 3. 运行基准测试（自动生成数据、清理 S3、上传、计算、写回结果）
+#    默认：1 Region, 1KB JSON
 MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
   cargo run --release --example bench_region_cluster_client
+
+#    50 Region, 4KB JSON
+MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
+  cargo run --release --example bench_region_cluster_client -- -r 50 -j 4096
 ```
+
+**基准测试命令行参数**：
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `-r` / `--regions` | Region 数量 | 1 |
+| `-j` / `--json-size` | 每条轨迹 JSON 大小（字节） | 1024 |
 
 **Executor 命令行参数**：
 

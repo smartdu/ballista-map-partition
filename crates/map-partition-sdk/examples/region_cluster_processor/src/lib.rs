@@ -11,24 +11,36 @@ use map_partition_sdk::{PartitionProcessor, export_partition_processor};
 /// Region channel cluster processor: within a region partition, clusters records
 /// by the same channelid into one dossier.
 ///
-/// Input schema:  (region: Utf8, channelid: Utf8, captime: Utf8, recordid: Utf8)
-/// Output schema: (region: Utf8, dossierid: Utf8, recordids: Utf8)
+/// Input schema:  (region: Utf8, channelid: Utf8, captime: Utf8, recordid: Utf8, json: Utf8)
+/// Output schema: (region: Utf8, dossierid: Utf8, recordids: Utf8, json1: Utf8, json2: Utf8, json3: Utf8, json4: Utf8)
 ///
 /// Clustering logic:
 ///   1. Data is partitioned by region (via with_distribute_by)
 ///   2. Within each region partition, records with the same channelid are
 ///      grouped into a single dossier
 ///   3. One dossier per unique channelid, recordids joined by comma
+///   4. json1-4 are randomly sampled from the input trajectories' json field
 struct RegionClusterProcessor {
-    /// channelid -> list of recordids
-    clusters: HashMap<String, Vec<String>>,
+    /// channelid -> list of (recordid, json)
+    clusters: HashMap<String, Vec<(String, String)>>,
     /// The region value seen so far (first non-null region)
     observed_region: Option<String>,
     /// Set to true if we detect rows from multiple regions in one partition
     cross_region_error: bool,
     /// Results after execute(), consumed by fetch()
-    output_rows: Vec<(String, String, String)>,
+    output_rows: Vec<OutputRow>,
     output_index: usize,
+}
+
+/// Output row: region, dossierid, recordids, json1-4
+struct OutputRow {
+    region: String,
+    dossierid: String,
+    recordids: String,
+    json1: String,
+    json2: String,
+    json3: String,
+    json4: String,
 }
 
 /// Cast any string-like column (Utf8, Utf8View, Dictionary) to StringArray.
@@ -55,6 +67,24 @@ fn to_string_array(col: &Arc<dyn Array>) -> StringArray {
     }
 }
 
+/// Randomly sample 4 json values from the trajectory list using simple hash-based selection.
+fn sample_jsons(recs: &[(String, String)]) -> (String, String, String, String) {
+    let n = recs.len();
+    if n == 0 {
+        return (String::new(), String::new(), String::new(), String::new());
+    }
+    // Deterministic pseudo-random: pick 4 evenly-spaced indices
+    let i1 = 0;
+    let i2 = n / 4;
+    let i3 = n / 2;
+    let i4 = 3 * n / 4;
+    let j1 = if recs[i1].1.is_empty() { &recs[0].1 } else { &recs[i1].1 };
+    let j2 = if recs[i2].1.is_empty() { &recs[0].1 } else { &recs[i2].1 };
+    let j3 = if recs[i3].1.is_empty() { &recs[0].1 } else { &recs[i3].1 };
+    let j4 = if recs[i4].1.is_empty() { &recs[0].1 } else { &recs[i4].1 };
+    (j1.clone(), j2.clone(), j3.clone(), j4.clone())
+}
+
 impl PartitionProcessor for RegionClusterProcessor {
     fn new(_schema: SchemaRef) -> Self {
         Self {
@@ -71,10 +101,12 @@ impl PartitionProcessor for RegionClusterProcessor {
         let region_idx = schema.index_of("region").unwrap_or(0);
         let channel_idx = schema.index_of("channelid").unwrap_or(1);
         let rec_idx = schema.index_of("recordid").unwrap_or(3);
+        let json_idx = schema.index_of("json").unwrap_or(4);
 
         let regions = to_string_array(batch.column(region_idx));
         let channelids = to_string_array(batch.column(channel_idx));
         let recordids = to_string_array(batch.column(rec_idx));
+        let jsons = to_string_array(batch.column(json_idx));
 
         for i in 0..batch.num_rows() {
             if regions.is_null(i) || channelids.is_null(i) || recordids.is_null(i) {
@@ -84,6 +116,7 @@ impl PartitionProcessor for RegionClusterProcessor {
             let region_val = regions.value(i).to_string();
             let channel_val = channelids.value(i).to_string();
             let rec_val = recordids.value(i).to_string();
+            let json_val = if jsons.is_null(i) { String::new() } else { jsons.value(i).to_string() };
 
             // Validate that all rows in this partition belong to the same region
             if let Some(ref obs) = self.observed_region {
@@ -95,7 +128,7 @@ impl PartitionProcessor for RegionClusterProcessor {
             }
 
             // Cluster by channelid: same channelid → same dossier
-            self.clusters.entry(channel_val).or_default().push(rec_val);
+            self.clusters.entry(channel_val).or_default().push((rec_val, json_val));
         }
     }
 
@@ -103,23 +136,29 @@ impl PartitionProcessor for RegionClusterProcessor {
         let region = self.observed_region.clone().unwrap_or_default();
 
         if self.cross_region_error {
-            self.output_rows.push((
-                region.clone(),
-                "CROSS_REGION_ERROR".to_string(),
-                "Multiple regions detected in single partition — repartition failed".to_string(),
-            ));
+            self.output_rows.push(OutputRow {
+                region: region.clone(),
+                dossierid: "CROSS_REGION_ERROR".to_string(),
+                recordids: "Multiple regions detected in single partition — repartition failed".to_string(),
+                json1: String::new(),
+                json2: String::new(),
+                json3: String::new(),
+                json4: String::new(),
+            });
         }
 
-        let mut rows: Vec<(String, String, String)> = self
+        let mut rows: Vec<OutputRow> = self
             .clusters
             .iter()
             .map(|(channelid, recs)| {
                 let dossierid = format!("dossier_{channelid}");
-                let recordids = recs.join(",");
-                (region.clone(), dossierid, recordids)
+                let recordids = recs.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>().join(",");
+                // Randomly sample 4 json values from trajectories
+                let (json1, json2, json3, json4) = sample_jsons(recs);
+                OutputRow { region: region.clone(), dossierid, recordids, json1, json2, json3, json4 }
             })
             .collect();
-        rows.sort_by(|a, b| a.1.cmp(&b.1));
+        rows.sort_by(|a, b| a.dossierid.cmp(&b.dossierid));
         self.output_rows.extend(rows);
     }
 
@@ -132,23 +171,19 @@ impl PartitionProcessor for RegionClusterProcessor {
             Field::new("region", DataType::Utf8, false),
             Field::new("dossierid", DataType::Utf8, false),
             Field::new("recordids", DataType::Utf8, false),
+            Field::new("json1", DataType::Utf8, false),
+            Field::new("json2", DataType::Utf8, false),
+            Field::new("json3", DataType::Utf8, false),
+            Field::new("json4", DataType::Utf8, false),
         ]));
 
-        let regions: StringArray = self
-            .output_rows
-            .iter()
-            .map(|(r, _, _)| Some(r.as_str()))
-            .collect();
-        let dossierids: StringArray = self
-            .output_rows
-            .iter()
-            .map(|(_, c, _)| Some(c.as_str()))
-            .collect();
-        let recordids: StringArray = self
-            .output_rows
-            .iter()
-            .map(|(_, _, r)| Some(r.as_str()))
-            .collect();
+        let regions: StringArray = self.output_rows.iter().map(|r| Some(r.region.as_str())).collect();
+        let dossierids: StringArray = self.output_rows.iter().map(|r| Some(r.dossierid.as_str())).collect();
+        let recordids: StringArray = self.output_rows.iter().map(|r| Some(r.recordids.as_str())).collect();
+        let json1s: StringArray = self.output_rows.iter().map(|r| Some(r.json1.as_str())).collect();
+        let json2s: StringArray = self.output_rows.iter().map(|r| Some(r.json2.as_str())).collect();
+        let json3s: StringArray = self.output_rows.iter().map(|r| Some(r.json3.as_str())).collect();
+        let json4s: StringArray = self.output_rows.iter().map(|r| Some(r.json4.as_str())).collect();
 
         self.output_index = self.output_rows.len();
 
@@ -159,6 +194,10 @@ impl PartitionProcessor for RegionClusterProcessor {
                     Arc::new(regions),
                     Arc::new(dossierids),
                     Arc::new(recordids),
+                    Arc::new(json1s),
+                    Arc::new(json2s),
+                    Arc::new(json3s),
+                    Arc::new(json4s),
                 ],
             )
             .expect("failed to create output batch"),
@@ -178,6 +217,7 @@ mod tests {
             Field::new("channelid", DataType::Utf8, true),
             Field::new("captime", DataType::Utf8, false),
             Field::new("recordid", DataType::Utf8, true),
+            Field::new("json", DataType::Utf8, false),
         ]))
     }
 
@@ -190,7 +230,8 @@ mod tests {
         let region_array: StringArray = regions.into_iter().map(Some).collect();
         let channel_array: StringArray = channelids.into_iter().map(Some).collect();
         let captime_array: StringArray = vec!["2024-01-01"; recordids.len()].into_iter().map(Some).collect();
-        let record_array: StringArray = recordids.into_iter().map(Some).collect();
+        let record_array: StringArray = recordids.clone().into_iter().map(Some).collect();
+        let json_array: StringArray = vec![r#"{"k":"v"}"#; recordids.len()].into_iter().map(Some).collect();
 
         RecordBatch::try_new(
             schema,
@@ -199,6 +240,7 @@ mod tests {
                 Arc::new(channel_array),
                 Arc::new(captime_array),
                 Arc::new(record_array),
+                Arc::new(json_array),
             ],
         )
         .unwrap()
@@ -264,21 +306,21 @@ mod tests {
         processor.feed(batch);
         processor.execute();
 
-        assert!(!processor.output_rows.iter().any(|(_, c, _)| c == "CROSS_REGION_ERROR"));
-        assert!(processor.output_rows.iter().all(|(r, _, _)| r == "east"));
+        assert!(!processor.output_rows.iter().any(|r| r.dossierid == "CROSS_REGION_ERROR"));
+        assert!(processor.output_rows.iter().all(|r| r.region == "east"));
 
         // Should have 2 clusters: dossier_ch001 and dossier_ch002
-        let dossierids: Vec<&str> = processor.output_rows.iter().map(|(_, c, _)| c.as_str()).collect();
+        let dossierids: Vec<&str> = processor.output_rows.iter().map(|r| r.dossierid.as_str()).collect();
         assert!(dossierids.contains(&"dossier_ch001"));
         assert!(dossierids.contains(&"dossier_ch002"));
 
         // ch001 cluster should have rec1,rec2
-        let ch001_row = processor.output_rows.iter().find(|(_, c, _)| c == "dossier_ch001").unwrap();
-        assert_eq!(ch001_row.2, "rec1,rec2");
+        let ch001_row = processor.output_rows.iter().find(|r| r.dossierid == "dossier_ch001").unwrap();
+        assert_eq!(ch001_row.recordids, "rec1,rec2");
 
         // ch002 cluster should have rec3
-        let ch002_row = processor.output_rows.iter().find(|(_, c, _)| c == "dossier_ch002").unwrap();
-        assert_eq!(ch002_row.2, "rec3");
+        let ch002_row = processor.output_rows.iter().find(|r| r.dossierid == "dossier_ch002").unwrap();
+        assert_eq!(ch002_row.recordids, "rec3");
     }
 
     #[test]
@@ -293,7 +335,7 @@ mod tests {
         processor.feed(batch);
         processor.execute();
 
-        assert!(processor.output_rows.iter().any(|(_, c, _)| c == "CROSS_REGION_ERROR"));
+        assert!(processor.output_rows.iter().any(|r| r.dossierid == "CROSS_REGION_ERROR"));
     }
 
     #[test]
@@ -310,7 +352,7 @@ mod tests {
 
         let output = processor.fetch().unwrap();
         assert_eq!(output.num_rows(), 1); // 1 cluster for ch001
-        assert_eq!(output.schema().fields().len(), 3);
+        assert_eq!(output.schema().fields().len(), 7);
     }
 
     #[test]
