@@ -603,6 +603,9 @@ impl ExecutionPlan for MapPartitionExec {
                         monitor_log("info", "finish", &format!("partition={partition} key={key_str} finished"), labels);
                     }
                 }
+
+                // 所有 processor 已 finish 并释放，通知 glibc 归还空闲内存页给 OS
+                unsafe { libc::malloc_trim(0) };
             } else {
                 // ===== Original mode: single processor per partition =====
 
@@ -804,6 +807,9 @@ impl ExecutionPlan for MapPartitionExec {
                     monitor_finish_processor(&monitor_id, finish_dur);
                     monitor_log("info", "finish", &format!("partition={partition} finished"), labels);
                 }
+
+                // processor 已 finish 并释放，通知 glibc 归还空闲内存页给 OS
+                unsafe { libc::malloc_trim(0) };
             }
 
             #[cfg(feature = "monitoring")]
