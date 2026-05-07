@@ -35,6 +35,11 @@ arrow-ipc = { version = "54" }
 libloading = "0.8"
 libc = "0.2"
 
+ballista-monitor = { path = "../ballista-monitor", optional = true }
+
+[features]
+monitoring = ["ballista-monitor"]
+
 [dev-dependencies]
 env_logger = "0.11"
 

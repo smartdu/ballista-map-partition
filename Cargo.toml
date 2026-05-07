@@ -3,5 +3,6 @@ members = [
     "crates/ballista-map-partition",
     "crates/map-partition-sdk",
     "crates/map-partition-sdk/examples/region_cluster_processor",
+    "crates/ballista-monitor",
 ]
 resolver = "3"

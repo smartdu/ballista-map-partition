@@ -19,6 +19,12 @@ use datafusion::execution::{SessionState, SessionStateBuilder};
 ///
 /// 启动方式：
 ///   cargo run --example distributed_compute_scheduler
+///
+/// 启动方式（启用监控）：
+///   cargo run --example distributed_compute_scheduler --features monitoring -- --monitor-port 8080
+///
+/// 参数说明：
+///       --monitor-port PORT     监控 Web 服务端口 (默认 8080, 需启用 monitoring feature)
 
 #[tokio::main]
 async fn main() -> ballista_core::error::Result<()> {
@@ -26,6 +32,40 @@ async fn main() -> ballista_core::error::Result<()> {
         .filter_level(log::LevelFilter::Info)
         .is_test(true)
         .try_init();
+
+    let mut monitor_port: u16 = 8080;
+
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--monitor-port" => {
+                i += 1;
+                monitor_port = args[i].parse().expect("invalid monitor port number");
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // Start monitor server (no-op if monitoring feature is not enabled)
+    #[cfg(feature = "monitoring")]
+    {
+        let monitor_addr = format!("0.0.0.0:{monitor_port}");
+        log::info!("Starting monitor server on {monitor_addr}");
+        tokio::spawn(async move {
+            if let Err(e) = ballista_monitor::start_monitor_server(
+                "scheduler",
+                "scheduler",
+                &monitor_addr,
+                0,
+            )
+            .await
+            {
+                log::error!("Monitor server error: {e}");
+            }
+        });
+    }
 
     let config: SchedulerConfig = SchedulerConfig {
         override_logical_codec: Some(Arc::new(ExtendedBallistaLogicalCodec::default())),

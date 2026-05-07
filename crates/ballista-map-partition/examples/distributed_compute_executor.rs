@@ -19,10 +19,14 @@ use ballista_map_partition::codec::extension::{
 ///   # Executor #2
 ///   cargo run --example distributed_compute_executor -- -p 50053 --bind-grpc-port 50054 -c 4
 ///
+/// 启动方式（启用监控）：
+///   cargo run --example distributed_compute_executor --features monitoring -- --monitor-port 8081
+///
 /// 参数说明：
 ///   -p, --port PORT             Arrow Flight 服务端口 (默认 50051)
 ///       --bind-grpc-port PORT   gRPC 服务端口 (默认 50052)
 ///   -c, --concurrent-tasks N    并发任务数 (默认 CPU 核数)
+///       --monitor-port PORT     监控 Web 服务端口 (默认 8081, 需启用 monitoring feature)
 
 #[tokio::main]
 async fn main() -> ballista_core::error::Result<()> {
@@ -34,6 +38,7 @@ async fn main() -> ballista_core::error::Result<()> {
     let mut port: u16 = 50051;
     let mut grpc_port: u16 = 50052;
     let mut concurrent_tasks: usize = std::thread::available_parallelism().unwrap().get();
+    let mut monitor_port: u16 = 8081;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -51,9 +56,33 @@ async fn main() -> ballista_core::error::Result<()> {
                 i += 1;
                 concurrent_tasks = args[i].parse().expect("invalid concurrent tasks number");
             }
+            "--monitor-port" => {
+                i += 1;
+                monitor_port = args[i].parse().expect("invalid monitor port number");
+            }
             _ => {}
         }
         i += 1;
+    }
+
+    // Start monitor server (no-op if monitoring feature is not enabled)
+    #[cfg(feature = "monitoring")]
+    {
+        let monitor_addr = format!("0.0.0.0:{monitor_port}");
+        let node_name = format!("executor-{port}");
+        log::info!("Starting monitor server on {monitor_addr}");
+        tokio::spawn(async move {
+            if let Err(e) = ballista_monitor::start_monitor_server(
+                "executor",
+                &node_name,
+                &monitor_addr,
+                concurrent_tasks,
+            )
+            .await
+            {
+                log::error!("Monitor server error: {e}");
+            }
+        });
     }
 
     let config: ExecutorProcessConfig = ExecutorProcessConfig {
