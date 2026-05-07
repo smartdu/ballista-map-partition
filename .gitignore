@@ -1,5 +1,6 @@
-# 测试数据（仅保留 test.parquet 和 face_capture/，忽略其他生成的数据文件）
+# 测试数据（仅保留指定数据文件，忽略其他生成的数据文件）
 data/*
 !data/test.parquet
 !data/face_capture/
+!data/region_face_capture/
 target/
