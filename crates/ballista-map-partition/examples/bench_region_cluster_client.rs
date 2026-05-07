@@ -95,7 +95,7 @@ async fn main() -> datafusion::common::Result<()> {
              num_regions * NUM_CHANNELS_PER_REGION, NUM_CHANNELS_PER_REGION);
     println!("========================================");
 
-    // ===== 1. 生成测试数据 =====
+    // ===== 1. 生成测试数据并写入 S3 =====
     let gen_start = Instant::now();
 
     let schema = Arc::new(Schema::new(vec![
@@ -106,20 +106,49 @@ async fn main() -> datafusion::common::Result<()> {
         Field::new("json", DataType::Utf8, false),
     ]));
 
-    let mut regions_vec: Vec<String> = Vec::with_capacity(total_rows);
-    let mut channelids_vec: Vec<String> = Vec::with_capacity(total_rows);
-    let mut captimes_vec: Vec<String> = Vec::with_capacity(total_rows);
-    let mut recordids_vec: Vec<String> = Vec::with_capacity(total_rows);
-    let mut jsons_vec: Vec<String> = Vec::with_capacity(total_rows);
+    // 按 region 分批生成，避免单个 RecordBatch 超过 Arrow 2GB 偏移量限制
+    let rows_per_region = NUM_CHANNELS_PER_REGION * NUM_TRAJECTORIES_PER_CHANNEL;
+    let data_len = json_size.saturating_sub(32);
 
+    let s3_config = ballista_core::object_store::session_config_with_s3_support();
+    let local_state = ballista_core::object_store::session_state_with_s3_support(s3_config)?;
+    let local_ctx = SessionContext::new_with_state(local_state);
+    local_ctx.sql("SET s3.allow_http = true").await?.show().await?;
+    local_ctx.sql(&format!("SET s3.access_key_id = '{S3_ACCESS_KEY_ID}'"))
+        .await?.show().await?;
+    local_ctx.sql(&format!("SET s3.secret_access_key = '{S3_SECRET_KEY}'"))
+        .await?.show().await?;
+    local_ctx.sql(&format!("SET s3.endpoint = '{S3_ENDPOINT}'"))
+        .await?.show().await?;
+
+    // 清理 S3 旧数据
+    {
+        let s3_url = url::Url::parse(&format!("s3://{S3_BUCKET}/bench_region_face_capture/"))
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let store = local_ctx.runtime_env().object_store_registry.get_store(&s3_url)?;
+        let prefix = object_store::path::Path::from("bench_region_face_capture");
+        let mut objects = Box::pin(store.list(Some(&prefix)));
+        while let Some(obj) = objects.next().await {
+            if let Ok(meta) = obj {
+                let _ = store.delete(&meta.location).await;
+            }
+        }
+    }
+    println!("[Info] 已清理 S3 旧数据");
+
+    let s3_url = format!("s3://{S3_BUCKET}/bench_region_face_capture/");
     for region_idx in 0..num_regions {
         let region_val = format!("region_{region_idx:04}");
+        let mut regions_vec: Vec<String> = Vec::with_capacity(rows_per_region);
+        let mut channelids_vec: Vec<String> = Vec::with_capacity(rows_per_region);
+        let mut captimes_vec: Vec<String> = Vec::with_capacity(rows_per_region);
+        let mut recordids_vec: Vec<String> = Vec::with_capacity(rows_per_region);
+        let mut jsons_vec: Vec<String> = Vec::with_capacity(rows_per_region);
+
         for channel_idx in 0..NUM_CHANNELS_PER_REGION {
             let channel_val = format!("ch_{channel_idx:03}");
             for traj_idx in 0..NUM_TRAJECTORIES_PER_CHANNEL {
                 let rec_val = format!("rec_{region_idx:04}_{channel_idx:03}_{traj_idx:04}");
-                // {"id":"0000_000_0000","data":"xxx..."} 固定结构占 32 字节，data 填充剩余
-                let data_len = json_size.saturating_sub(32);
                 let json_val = format!(
                     "{{\"id\":\"{region_idx:04}_{channel_idx:03}_{traj_idx:04}\",\"data\":\"{}\"}}",
                     "x".repeat(data_len)
@@ -132,65 +161,37 @@ async fn main() -> datafusion::common::Result<()> {
                 jsons_vec.push(json_val);
             }
         }
-    }
 
-    let region_array: StringArray = regions_vec.iter().map(|s| Some(s.as_str())).collect();
-    let channel_array: StringArray = channelids_vec.iter().map(|s| Some(s.as_str())).collect();
-    let captime_array: StringArray = captimes_vec.iter().map(|s| Some(s.as_str())).collect();
-    let record_array: StringArray = recordids_vec.iter().map(|s| Some(s.as_str())).collect();
-    let json_array: StringArray = jsons_vec.iter().map(|s| Some(s.as_str())).collect();
+        let region_array: StringArray = regions_vec.iter().map(|s| Some(s.as_str())).collect();
+        let channel_array: StringArray = channelids_vec.iter().map(|s| Some(s.as_str())).collect();
+        let captime_array: StringArray = captimes_vec.iter().map(|s| Some(s.as_str())).collect();
+        let record_array: StringArray = recordids_vec.iter().map(|s| Some(s.as_str())).collect();
+        let json_array: StringArray = jsons_vec.iter().map(|s| Some(s.as_str())).collect();
 
-    let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(region_array),
-            Arc::new(channel_array),
-            Arc::new(captime_array),
-            Arc::new(record_array),
-            Arc::new(json_array),
-        ],
-    )?;
+        let batch = datafusion::arrow::record_batch::RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(region_array),
+                Arc::new(channel_array),
+                Arc::new(captime_array),
+                Arc::new(record_array),
+                Arc::new(json_array),
+            ],
+        )?;
 
-    let gen_elapsed = gen_start.elapsed();
-    println!("[Timer] 数据生成耗时: {:.2}s", gen_elapsed.as_secs_f64());
-
-    // ===== 2. 用本地 SessionContext 写入 S3 (不走 Ballista，避免序列化问题) =====
-    let s3_write_start = Instant::now();
-    {
-        let s3_config = ballista_core::object_store::session_config_with_s3_support();
-        let local_state = ballista_core::object_store::session_state_with_s3_support(s3_config)?;
-        let local_ctx = SessionContext::new_with_state(local_state);
-
-        local_ctx.sql("SET s3.allow_http = true").await?.show().await?;
-        local_ctx.sql(&format!("SET s3.access_key_id = '{S3_ACCESS_KEY_ID}'"))
-            .await?.show().await?;
-        local_ctx.sql(&format!("SET s3.secret_access_key = '{S3_SECRET_KEY}'"))
-            .await?.show().await?;
-        local_ctx.sql(&format!("SET s3.endpoint = '{S3_ENDPOINT}'"))
-            .await?.show().await?;
-
-        // 清理 S3 旧数据，避免多次运行导致数据累积
-        {
-            let s3_url = url::Url::parse(&format!("s3://{S3_BUCKET}/bench_region_face_capture/"))
-                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
-            let store = local_ctx.runtime_env().object_store_registry.get_store(&s3_url)?;
-            let prefix = object_store::path::Path::from("bench_region_face_capture");
-            let mut objects = Box::pin(store.list(Some(&prefix)));
-            while let Some(obj) = objects.next().await {
-                if let Ok(meta) = obj {
-                    let _ = store.delete(&meta.location).await;
-                }
-            }
-        }
-        println!("[Info] 已清理 S3 旧数据");
-
+        // 先注销旧表，避免重复注册
+        local_ctx.deregister_table("bench_data")?;
         local_ctx.register_batch("bench_data", batch)?;
         let df = local_ctx.sql("SELECT * FROM bench_data").await?;
-        let url = format!("s3://{S3_BUCKET}/bench_region_face_capture/");
-        df.write_parquet(&url, Default::default(), None).await?;
+        df.write_parquet(&s3_url, Default::default(), None).await?;
+
+        if region_idx % 10 == 0 || region_idx == num_regions - 1 {
+            println!("[Info] 已写入 region {}/{}", region_idx + 1, num_regions);
+        }
     }
-    let s3_write_elapsed = s3_write_start.elapsed();
-    println!("[Timer] S3 写入耗时: {:.2}s", s3_write_elapsed.as_secs_f64());
+
+    let gen_elapsed = gen_start.elapsed();
+    println!("[Timer] 数据生成+S3写入耗时: {:.2}s", gen_elapsed.as_secs_f64());
 
     // ===== 3. 创建 Ballista 远程 SessionContext =====
     let s3_config = ballista_core::object_store::session_config_with_s3_support();
@@ -280,8 +281,7 @@ async fn main() -> datafusion::common::Result<()> {
     println!("  预期档案数:     {}", num_regions * NUM_CHANNELS_PER_REGION);
     println!("  每 channelid 轨迹数: {}", NUM_TRAJECTORIES_PER_CHANNEL);
     println!("  JSON 大小:      {} 字节", json_size);
-    println!("  数据生成耗时:   {:.2}s", gen_elapsed.as_secs_f64());
-    println!("  S3 写入耗时:    {:.2}s", s3_write_elapsed.as_secs_f64());
+    println!("  数据生成+写入:  {:.2}s", gen_elapsed.as_secs_f64());
     println!("  分布式计算耗时: {:.2}s", compute_elapsed.as_secs_f64());
     println!("  吞吐量:         {:.0} records/s", total_rows as f64 / compute_elapsed.as_secs_f64());
     println!("  分区数:         {}", num_partitions);
