@@ -1175,6 +1175,7 @@ dependencies = [
  "libc",
  "libloading",
  "log",
+ "object_store",
  "prost",
  "prost-types",
  "tokio",
@@ -1182,6 +1183,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tonic-prost-build",
+ "url",
 ]
 
 [[package]]

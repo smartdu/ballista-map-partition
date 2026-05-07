@@ -16,6 +16,12 @@ pub fn start_system_collector(interval: Duration) {
         let mut networks = Networks::new_with_refreshed_list();
         let pid = sysinfo::get_current_pid().ok();
 
+        // Cleanup stale processors/metrics every 60 seconds
+        let cleanup_interval = Duration::from_secs(60);
+        let mut cleanup_timer = tokio::time::Instant::now();
+        // Remove finished processors/metrics older than 10 minutes
+        const CLEANUP_MAX_AGE_MS: i64 = 10 * 60 * 1000;
+
         loop {
             sys.refresh_all();
             disks.refresh(true);
@@ -77,6 +83,13 @@ pub fn start_system_collector(interval: Duration) {
                     - r.overview().started_at) as f64
                     / 1000.0;
                 r.record_gauge("process_uptime_secs", uptime, HashMap::new());
+
+                // Periodic cleanup of stale processors and metrics
+                if cleanup_timer.elapsed() >= cleanup_interval {
+                    r.cleanup_processors(CLEANUP_MAX_AGE_MS);
+                    r.cleanup_metrics(CLEANUP_MAX_AGE_MS);
+                    cleanup_timer = tokio::time::Instant::now();
+                }
             }
 
             time::sleep(interval).await;

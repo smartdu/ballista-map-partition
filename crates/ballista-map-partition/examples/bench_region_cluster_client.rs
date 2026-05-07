@@ -11,6 +11,8 @@ use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionContext, col};
+use futures::StreamExt;
+use object_store::ObjectStore;
 
 /// S3 配置常量（对应 MinIO 本地测试环境）
 const S3_BUCKET: &str = "ballista";
@@ -18,21 +20,23 @@ const S3_ACCESS_KEY_ID: &str = "MINIO";
 const S3_SECRET_KEY: &str = "MINIOSECRET";
 const S3_ENDPOINT: &str = "http://localhost:9000";
 
-/// DistributeBy 分区数 = region 数，确保每个 region 独占一个分区
-const NUM_PARTITIONS: usize = 1000;
+/// DistributeBy 分区数（框架保证每个 key 独立处理，hash 碰撞不影响正确性）
+const NUM_PARTITIONS: usize = 50;
 
 /// 数据集参数
-const NUM_REGIONS: usize = 1000;
+const NUM_REGIONS: usize = 50;
 const NUM_CHANNELS_PER_REGION: usize = 100;
-/// 总行数 = NUM_REGIONS * NUM_CHANNELS_PER_REGION = 100,000
-const TOTAL_ROWS: usize = NUM_REGIONS * NUM_CHANNELS_PER_REGION;
+const NUM_TRAJECTORIES_PER_CHANNEL: usize = 1000;
+/// 总行数 = NUM_REGIONS * NUM_CHANNELS_PER_REGION * NUM_TRAJECTORIES_PER_CHANNEL = 5,000,000
+const TOTAL_ROWS: usize = NUM_REGIONS * NUM_CHANNELS_PER_REGION * NUM_TRAJECTORIES_PER_CHANNEL;
 
 /// 按 Region 分区的聚类分布式计算 — 并发性能验证
 ///
 /// 数据集：
-///   - 100,000 条人脸抓拍记录
-///   - 1,000 个 region
+///   - 5,000,000 条人脸抓拍记录
+///   - 50 个 region（分区）
 ///   - 每个 region 100 个 channelid → 100 个档案
+///   - 每个 channelid 1000 条轨迹（recordid）
 ///
 /// 启动顺序：
 ///   1. 启动 MinIO (见 region_cluster_client 注释)
@@ -56,6 +60,7 @@ async fn main() -> datafusion::common::Result<()> {
     println!("  总行数:       {}", TOTAL_ROWS);
     println!("  Region 数:    {}", NUM_REGIONS);
     println!("  每 Region channelid 数: {}", NUM_CHANNELS_PER_REGION);
+    println!("  每 channelid 轨迹数:    {}", NUM_TRAJECTORIES_PER_CHANNEL);
     println!("  分区数:       {}", NUM_PARTITIONS);
     println!("  预期档案数:   {} (每 region {} 个)",
              NUM_REGIONS * NUM_CHANNELS_PER_REGION, NUM_CHANNELS_PER_REGION);
@@ -80,11 +85,14 @@ async fn main() -> datafusion::common::Result<()> {
         let region_val = format!("region_{region_idx:04}");
         for channel_idx in 0..NUM_CHANNELS_PER_REGION {
             let channel_val = format!("ch_{channel_idx:03}");
-            let rec_val = format!("rec_{region_idx:04}_{channel_idx:03}");
-            regions_vec.push(region_val.clone());
-            channelids_vec.push(channel_val);
-            captimes_vec.push(format!("2024-01-{:02}T10:00:00", (channel_idx % 28) + 1));
-            recordids_vec.push(rec_val);
+            for traj_idx in 0..NUM_TRAJECTORIES_PER_CHANNEL {
+                let rec_val = format!("rec_{region_idx:04}_{channel_idx:03}_{traj_idx:04}");
+                regions_vec.push(region_val.clone());
+                channelids_vec.push(channel_val.clone());
+                captimes_vec.push(format!("2024-01-{:02}T{:02}:00:00",
+                    (traj_idx % 28) + 1, (traj_idx % 24)));
+                recordids_vec.push(rec_val);
+            }
         }
     }
 
@@ -120,6 +128,21 @@ async fn main() -> datafusion::common::Result<()> {
             .await?.show().await?;
         local_ctx.sql(&format!("SET s3.endpoint = '{S3_ENDPOINT}'"))
             .await?.show().await?;
+
+        // 清理 S3 旧数据，避免多次运行导致数据累积
+        {
+            let s3_url = url::Url::parse(&format!("s3://{S3_BUCKET}/bench_region_face_capture/"))
+                .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+            let store = local_ctx.runtime_env().object_store_registry.get_store(&s3_url)?;
+            let prefix = object_store::path::Path::from("bench_region_face_capture");
+            let mut objects = Box::pin(store.list(Some(&prefix)));
+            while let Some(obj) = objects.next().await {
+                if let Ok(meta) = obj {
+                    let _ = store.delete(&meta.location).await;
+                }
+            }
+        }
+        println!("[Info] 已清理 S3 旧数据");
 
         local_ctx.register_batch("bench_data", batch)?;
         let df = local_ctx.sql("SELECT * FROM bench_data").await?;
@@ -159,7 +182,22 @@ async fn main() -> datafusion::common::Result<()> {
         .show()
         .await?;
 
-    // ===== 4. 从 S3 读取并执行 DistributeBy + MapPartition =====
+    // ===== 4. 清理 S3 旧结果 =====
+    let output_path = format!("s3://{S3_BUCKET}/bench_region_cluster_result/");
+    {
+        let s3_url = url::Url::parse(&format!("s3://{S3_BUCKET}/bench_region_cluster_result/"))
+            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let store = ctx.runtime_env().object_store_registry.get_store(&s3_url)?;
+        let prefix = object_store::path::Path::from("bench_region_cluster_result");
+        let mut objects = Box::pin(store.list(Some(&prefix)));
+        while let Some(obj) = objects.next().await {
+            if let Ok(meta) = obj {
+                let _ = store.delete(&meta.location).await;
+            }
+        }
+    }
+
+    // ===== 5. 从 S3 读取并执行 DistributeBy + MapPartition，结果直接写回 S3 =====
     let compute_start = Instant::now();
 
     let s3_path = format!("s3://{S3_BUCKET}/bench_region_face_capture/");
@@ -180,11 +218,13 @@ async fn main() -> datafusion::common::Result<()> {
         .with_distribute_by(col("region"), NUM_PARTITIONS)?
         .build()?;
 
-    // 收集结果（触发实际计算）
-    let result = df.collect().await?;
+    // Executor 端直接写 S3，不拉到客户端
+    df.write_parquet(&output_path, Default::default(), None).await?;
     let compute_elapsed = compute_start.elapsed();
+    println!("[Info] 聚类结果已写入 {}", output_path);
 
-    // ===== 5. 输出性能统计 =====
+    // ===== 6. 读回结果验证正确性 =====
+    let result = ctx.read_parquet(&output_path, Default::default()).await?.collect().await?;
     let total_output_rows: usize = result.iter().map(|b| b.num_rows()).sum();
 
     println!();
@@ -194,6 +234,7 @@ async fn main() -> datafusion::common::Result<()> {
     println!("  输入行数:       {}", TOTAL_ROWS);
     println!("  输出行数:       {} (档案数)", total_output_rows);
     println!("  预期档案数:     {}", NUM_REGIONS * NUM_CHANNELS_PER_REGION);
+    println!("  每 channelid 轨迹数: {}", NUM_TRAJECTORIES_PER_CHANNEL);
     println!("  数据生成耗时:   {:.2}s", gen_elapsed.as_secs_f64());
     println!("  S3 写入耗时:    {:.2}s", s3_write_elapsed.as_secs_f64());
     println!("  分布式计算耗时: {:.2}s", compute_elapsed.as_secs_f64());
@@ -228,20 +269,6 @@ async fn main() -> datafusion::common::Result<()> {
     } else {
         println!("[OK] 无 CROSS_REGION_ERROR，DistributeBy 语义正确");
     }
-
-    // 将结果写回 S3
-    let output_path = format!("s3://{S3_BUCKET}/bench_region_cluster_result/");
-    let df_result = ctx.read_parquet(&s3_path, Default::default()).await?;
-    let df_result = df_result
-        .map_partition(&so_path, "region_cluster_processor", Arc::new(Schema::new(vec![
-            Field::new("region", DataType::Utf8, false),
-            Field::new("dossierid", DataType::Utf8, false),
-            Field::new("recordids", DataType::Utf8, false),
-        ])))?
-        .with_distribute_by(col("region"), NUM_PARTITIONS)?
-        .build()?;
-    df_result.write_parquet(&output_path, Default::default(), None).await?;
-    println!("[Info] 结果已写入 {}", output_path);
 
     Ok(())
 }

@@ -167,13 +167,12 @@ fn compute_properties(
 // ---- Monitoring helpers (only compiled with `monitoring` feature) ----
 
 #[cfg(feature = "monitoring")]
-fn monitor_labels(partition: usize, so_path: &str, key: Option<&str>) -> HashMap<String, String> {
+fn monitor_labels(partition: usize, so_path: &str, _key: Option<&str>) -> HashMap<String, String> {
     let mut labels = HashMap::new();
     labels.insert("partition".to_string(), partition.to_string());
     labels.insert("so_path".to_string(), so_path.to_string());
-    if let Some(k) = key {
-        labels.insert("key".to_string(), k.to_string());
-    }
+    // Note: key is intentionally excluded to avoid metric cardinality explosion.
+    // Per-key data is tracked via ProcessorInfo instead.
     labels
 }
 

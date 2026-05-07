@@ -42,6 +42,8 @@ monitoring = ["ballista-monitor"]
 
 [dev-dependencies]
 env_logger = "0.11"
+object_store = "0.12"
+url = "2"
 
 [build-dependencies]
 tonic-build = { version = "0.14" }

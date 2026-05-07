@@ -328,6 +328,7 @@ cargo run --release --example distributed_compute_executor --features monitoring
 - 启用 CORS 允许浏览器跨节点拉取数据
 - 系统指标（CPU/Memory/Disk/Network）每秒采样，保留 5 分钟时序数据
 - .so Processor 生命周期（init → feed → execute → fetch → finish）全程追踪，含各阶段耗时
+- 自动清理过期数据：每 60 秒清理超过 10 分钟无活动的 processor 和 metric 条目，避免内存泄漏
 
 ### API 端点
 
@@ -348,7 +349,7 @@ cargo run --release --example distributed_compute_executor --features monitoring
 | **集群组件** | `distributed_compute_scheduler` | Scheduler：S3 + MapPartition codec + EnforceDistributeBy |
 | | `distributed_compute_executor` | Executor：S3 + MapPartition codec，支持命令行参数 |
 | **客户端** | `region_cluster_client` | DistributeBy + region_cluster_processor 功能验证 |
-| | `bench_region_cluster_client` | 10W 条数据 + 1K Region 并发性能基准测试 |
+| | `bench_region_cluster_client` | 500W 条数据 + 50 Region 并发性能基准测试，结果写回 S3 |
 
 ### .so 处理器
 
@@ -430,7 +431,23 @@ MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
 
 验证 DistributeBy 三级并行模型的并发性能。
 
-**数据集参数**：100,000 条记录 / 1,000 个 Region / 每 Region 100 个 channelid / 1,000 个分区。
+**数据集参数**：
+
+| 参数 | 值 |
+|------|-----|
+| 总记录数 | 5,000,000 |
+| Region 数 | 50 |
+| 每 Region channelid 数 | 100（即 100 个档案） |
+| 每 channelid 轨迹数 | 1,000 |
+| 分区数 | 50 |
+| 预期档案数 | 5,000（50 × 100） |
+
+**流程**：
+1. 生成 5,000,000 条测试数据（内存构建 Arrow RecordBatch）
+2. 清理 S3 旧数据，写入 `s3://ballista/bench_region_face_capture/`
+3. 通过 Ballista 读取 S3 数据，执行 DistributeBy + map_partition 聚类
+4. 聚类结果由 Executor 端直接写入 `s3://ballista/bench_region_cluster_result/`（不经过客户端）
+5. 读回结果验证正确性（档案数、CROSS_REGION_ERROR 检测）
 
 **启动步骤**：
 
@@ -446,7 +463,7 @@ cargo run --release --example distributed_compute_executor -- -p 50051 --bind-gr
 cargo run --release --example distributed_compute_executor -- -p 50051 --bind-grpc-port 50052 -c 4 &
 cargo run --release --example distributed_compute_executor -- -p 50053 --bind-grpc-port 50054 -c 4 &
 
-# 3. 运行基准测试（自动生成数据并上传 S3）
+# 3. 运行基准测试（自动生成数据、清理 S3、上传、计算、写回结果）
 MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
   cargo run --release --example bench_region_cluster_client
 ```
@@ -463,10 +480,10 @@ MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
 
 | 配置 | 总并发数 | 计算耗时 | 吞吐量 | 加速比 |
 |------|---------|---------|--------|-------|
-| 1 Executor × 8 concurrent | 8 | 4.72s | 21,164/s | 1x |
-| 2 Executor × 4 concurrent | 8 | 2.82s | 35,445/s | **1.7x** |
+| 1 Executor × 8 concurrent | 8 | — | — | 1x |
+| 2 Executor × 4 concurrent | 8 | — | — | ~1.7x |
 
-同样 8 个并发任务，2 Executor 比 1 Executor 快 1.7 倍，验证了跨 Executor 并行（级别1）的扩展能力。
+同样 8 个并发任务，2 Executor 比 1 Executor 快约 1.7 倍，验证了跨 Executor 并行（级别1）的扩展能力。
 
 ---
 

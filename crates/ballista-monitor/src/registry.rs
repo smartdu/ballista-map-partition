@@ -239,6 +239,17 @@ impl MetricsRegistry {
         });
     }
 
+    /// Remove metric entries whose latest sample is older than a threshold.
+    pub fn cleanup_metrics(&mut self, max_age_ms: i64) {
+        let now = now_millis();
+        self.metrics.retain(|_, entry| {
+            match entry.latest_timestamp() {
+                Some(ts) => (now - ts) < max_age_ms,
+                None => false,
+            }
+        });
+    }
+
     /// Get all processor info.
     pub fn get_processors(&self) -> &[ProcessorInfo] {
         &self.processors

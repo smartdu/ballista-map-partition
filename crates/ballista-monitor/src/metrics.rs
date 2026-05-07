@@ -46,6 +46,11 @@ impl MetricEntry {
         self.samples.last().map(|s| s.value)
     }
 
+    /// Get the latest sample timestamp, if any.
+    pub fn latest_timestamp(&self) -> Option<i64> {
+        self.samples.last().map(|s| s.timestamp)
+    }
+
     /// Get samples since a given timestamp (ms since epoch).
     pub fn history_since(&self, since: i64) -> Vec<MetricSample> {
         self.samples
