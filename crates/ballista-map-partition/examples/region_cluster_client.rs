@@ -21,8 +21,8 @@ const NUM_PARTITIONS: usize = 100;
 
 /// 按 Region 分区的聚类分布式计算客户端
 ///
-/// 输入：人脸抓拍数据 (region, channelid, captime, recordid)
-/// 输出：聚类结果 (region, dossierid, recordids)
+/// 输入：人脸抓拍数据 (region, channelid, captime, recordid, json)
+/// 输出：聚类结果 (region, dossierid, recordids, json1, json2, json3, json4)
 ///
 /// 特性：
 ///   1. 输入含 region 字段
@@ -91,11 +91,15 @@ async fn main() -> datafusion::common::Result<()> {
     println!("--- Input: region face capture data ---");
     df.clone().show().await?;
 
-    // 输出 schema: (region, dossierid, recordids)
+    // 输出 schema: (region, dossierid, recordids, json1, json2, json3, json4)
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("region", DataType::Utf8, false),
         Field::new("dossierid", DataType::Utf8, false),
         Field::new("recordids", DataType::Utf8, false),
+        Field::new("json1", DataType::Utf8, false),
+        Field::new("json2", DataType::Utf8, false),
+        Field::new("json3", DataType::Utf8, false),
+        Field::new("json4", DataType::Utf8, false),
     ]));
 
     let so_path = std::env::var("MAP_PARTITION_SO")
