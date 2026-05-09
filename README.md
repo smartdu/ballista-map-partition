@@ -398,12 +398,36 @@ MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
 
 **基准测试结果对比**：
 
-| 配置 | 总并发数 | 计算耗时 | 吞吐量 | 加速比 |
-|------|---------|---------|--------|-------|
-| 1 Executor × 8 concurrent | 8 | — | — | 1x |
-| 2 Executor × 4 concurrent | 8 | — | — | ~1.7x |
+| 配置 | 输入行数 | 数据集大小 | 计算耗时 | 吞吐量 | 资源说明 |
+|------|---------|-----------|---------|--------|---------|
+| 1 Executor × 8 concurrent (50 regions, 4KB) | 5,000,000 | ~20GB (IPC) | 14.33s | 348,954 rec/s | 见下方资源监控 |
 
-同样 8 个并发任务，2 Executor 比 1 Executor 快约 1.7 倍，验证了跨 Executor 并行（级别1）的扩展能力。
+**测试条件**：
+- Region 数: 50，每 Region 100 个 channelid，每 channelid 1000 条轨迹
+- 每条轨迹含 4KB JSON，总数据量约 5,000,000 行
+- 分区数: 50（自动匹配 Region 数）
+- Executor 并发: 8（与 CPU 核数一致）
+
+**资源使用监控**：
+
+| 进程 | 空闲内存 | 峰值内存 (计算阶段) | CPU 使用率 |
+|------|---------|-------------------|-----------|
+| MinIO | ~183 MB | ~409 MB | <1%（稳态，数据读取为主） |
+| Scheduler | ~20 MB | ~70 MB | <1%（仅协调调度） |
+| Executor | ~21 MB | ~4.9 GB（.so 处理器加载轨迹数据） | 高负载（计算阶段） |
+| Bench Client | — | 瞬时（仅生成数据 + 提交任务） | — |
+
+内存随时间变化（Executor 侧）：
+```
+计算前   →  数据加载中   →  峰值       →  finish 后
+~21 MB  →  3.1 GB      →  4.9 GB   →  ~892 MB
+```
+
+**分析**：
+- Executor 内存峰值 ~4.9GB，主要消耗在 `.so` 处理器内部加载 5,000,000 条轨迹数据。每个 region 的 processor 持有全部轨迹做聚类，50 个 region 串行执行时峰值约 4.9GB
+- MinIO 和 Scheduler 资源消耗极低，说明性能瓶颈在 Executor 端的内存和计算
+- 数据生成 + S3 写入耗时 12.29s，分布式计算耗时 14.33s，两者接近，计算效率较高
+- 计算完成后 Executor 内存回落到 ~892MB（部分缓存未完全释放，`malloc_trim` 已调用）
 
 ---
 
