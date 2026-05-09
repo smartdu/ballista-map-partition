@@ -1175,7 +1175,6 @@ dependencies = [
  "env_logger",
  "futures",
  "futures-util",
- "libc",
  "libloading",
  "log",
  "object_store",

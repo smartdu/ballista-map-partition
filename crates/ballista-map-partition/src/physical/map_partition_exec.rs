@@ -425,8 +425,6 @@ impl ExecutionPlan for MapPartitionExec {
                     }
                 }
 
-                // 所有 processor 已 finish 并释放，通知 glibc 归还空闲内存页给 OS
-                unsafe { libc::malloc_trim(0) };
             } else {
                 // ===== Original mode: single processor per partition =====
 
@@ -548,8 +546,6 @@ impl ExecutionPlan for MapPartitionExec {
                     )));
                 }
 
-                // processor 已 finish 并释放，通知 glibc 归还空闲内存页给 OS
-                unsafe { libc::malloc_trim(0) };
             }
 
             Ok(())
