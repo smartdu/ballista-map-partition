@@ -17,6 +17,9 @@ pub trait PartitionProcessor: Send + Sized + 'static {
     /// Receives the input schema so you can prepare accordingly.
     fn new(schema: SchemaRef) -> Self;
 
+    /// Returns the input schema. Used by the framework to decode FFI arrays.
+    fn schema(&self) -> &SchemaRef;
+
     /// Stream input data. Called once per RecordBatch in the partition.
     /// The framework releases the batch after this call returns.
     fn feed(&mut self, batch: RecordBatch);

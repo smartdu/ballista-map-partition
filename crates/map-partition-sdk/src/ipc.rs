@@ -1,7 +1,9 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::array::{Array, StructArray};
+use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::ffi::{FFI_ArrowArray, from_ffi_and_data_type, to_ffi};
 use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
@@ -52,4 +54,52 @@ pub fn encode_schema(schema: &Schema) -> Result<Vec<u8>, String> {
         .finish()
         .map_err(|e| format!("failed to finish IPC schema writer: {e}"))?;
     Ok(buf)
+}
+
+/// Import a RecordBatch from a raw FFI_ArrowArray pointer via the Arrow C Data Interface.
+///
+/// Takes ownership of the array at `array_ptr` (replacing it with an empty struct).
+/// The framework must have wrapped its local FFI_ArrowArray in ManuallyDrop before
+/// passing the pointer, since this function replaces the pointed-to value.
+///
+/// # Safety
+///
+/// `array_ptr` must point to a valid `FFI_ArrowArray` exported by the framework.
+pub unsafe fn import_batch_from_ffi(
+    array_ptr: *mut FFI_ArrowArray,
+    data_type: DataType,
+) -> Result<RecordBatch, String> {
+    // Safety: caller guarantees `array_ptr` points to a valid FFI_ArrowArray
+    // exported by the framework.
+    unsafe {
+        let ffi_array = FFI_ArrowArray::from_raw(array_ptr);
+        let array_data = from_ffi_and_data_type(ffi_array, data_type)
+            .map_err(|e| format!("from_ffi_and_data_type: {e}"))?;
+        let struct_array = StructArray::from(array_data);
+        Ok(RecordBatch::from(struct_array))
+    }
+}
+
+/// Export a RecordBatch to a raw FFI_ArrowArray pointer via the Arrow C Data Interface.
+///
+/// The framework pre-allocates an empty FFI_ArrowArray and calls the .so's `_fetch`.
+/// This function fills that slot with the exported array data.
+///
+/// # Safety
+///
+/// `array_ptr` must point to a valid, pre-allocated `FFI_ArrowArray::empty()` slot.
+pub unsafe fn export_batch_to_ffi(
+    batch: RecordBatch,
+    array_ptr: *mut FFI_ArrowArray,
+) -> Result<(), String> {
+    let struct_array = StructArray::from(batch);
+    let data = struct_array.into_data();
+    let (ffi_array, _ffi_schema) =
+        to_ffi(&data).map_err(|e| format!("to_ffi: {e}"))?;
+    // Write into the caller's pre-allocated slot.
+    // Safety: caller guarantees `array_ptr` is valid for writes and is a
+    // pre-allocated FFI_ArrowArray::empty() slot. We write the exported data
+    // and forget the local to transfer ownership to the framework.
+    unsafe { std::ptr::write(array_ptr, ffi_array) };
+    Ok(())
 }

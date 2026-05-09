@@ -39,13 +39,15 @@ macro_rules! export_partition_processor {
             #[unsafe(no_mangle)]
             pub extern "C" fn [<$fn_name _feed>](
                 ctx: *mut std::ffi::c_void,
-                input_ptr: *const u8,
-                input_len: i64,
+                array: *mut $crate::FFI_ArrowArray,
             ) -> i32 {
                 let processor = unsafe { &mut *(ctx as *mut $processor_type) };
-                let input_bytes =
-                    unsafe { std::slice::from_raw_parts(input_ptr, input_len as usize) };
-                match $crate::decode_batch(input_bytes) {
+                let data_type = arrow::datatypes::DataType::Struct(
+                    processor.schema().fields().clone(),
+                );
+                match unsafe {
+                    $crate::import_batch_from_ffi(array, data_type)
+                } {
                     Ok(batch) => {
                         processor.feed(batch);
                         0
@@ -69,26 +71,18 @@ macro_rules! export_partition_processor {
             #[unsafe(no_mangle)]
             pub extern "C" fn [<$fn_name _fetch>](
                 ctx: *mut std::ffi::c_void,
-                output_ptr: *mut *mut u8,
-                output_len: *mut i64,
+                array: *mut $crate::FFI_ArrowArray,
             ) -> i32 {
                 let processor = unsafe { &mut *(ctx as *mut $processor_type) };
                 match processor.fetch() {
                     Some(batch) => {
-                        match $crate::encode_batch(&batch) {
-                            Ok(mut bytes) => {
-                                let len = bytes.len();
-                                let ptr = bytes.as_mut_ptr();
-                                std::mem::forget(bytes);
-                                unsafe {
-                                    *output_ptr = ptr;
-                                    *output_len = len as i64;
-                                }
-                                0 // more data may be available
-                            }
+                        match unsafe {
+                            $crate::export_batch_to_ffi(batch, array)
+                        } {
+                            Ok(()) => 0, // more data may be available
                             Err(e) => {
                                 eprintln!(
-                                    "[{}] fetch encode error: {}",
+                                    "[{}] fetch error: {}",
                                     stringify!($fn_name),
                                     e
                                 );
@@ -96,13 +90,7 @@ macro_rules! export_partition_processor {
                             }
                         }
                     }
-                    None => {
-                        unsafe {
-                            *output_ptr = std::ptr::null_mut();
-                            *output_len = 0;
-                        }
-                        1 // no more data
-                    }
+                    None => 1, // no more data
                 }
             }
 

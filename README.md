@@ -6,11 +6,11 @@
 
 Spark 提供了 `mapPartition` 算子，允许用户对每个分区的数据执行自定义逻辑。Rust 生态中 DataFusion/Ballista 没有等价算子，且 Rust 不支持闭包的序列化与反序列化，无法像 Spark 那样将用户代码分发到集群节点执行。
 
-本项目通过 **`.so` 动态库 + 五阶段流式生命周期** 的方案解决了这个问题：
+本项目通过 **`.so` 动态库 + Arrow C Data Interface 零拷贝 + 五阶段流式生命周期** 的方案解决了这个问题：
 
 - 用户将自定义分区处理逻辑编译为 `.so` 动态库
 - 调用 `map_partition` 算子时传入 `.so` 路径和函数名前缀
-- 框架在 Executor 节点上通过 `dlopen` 加载 `.so` 并调用对应接口
+- 框架在 Executor 节点上通过 `dlopen` 加载 `.so`，通过 Arrow C Data Interface 零拷贝传输数据
 - 利用 Ballista 的分布式调度能力，将计算逻辑分发到集群各节点执行
 
 ## 整体架构
@@ -61,7 +61,7 @@ ballista-map-partition/
 │   └── map-partition-sdk/              # SDK helper crate
 │       ├── src/
 │       │   ├── processor.rs            # PartitionProcessor trait
-│       │   ├── ipc.rs                  # Arrow IPC 编解码
+│       │   ├── ipc.rs                  # Schema IPC 编解码 + C Data Interface batch 传输
 │       │   └── export.rs               # export_partition_processor! 宏
 │       └── examples/
 │           └── region_cluster_processor/ # .so 处理器示例
@@ -108,13 +108,13 @@ ExtendedBallistaPhysicalCodec ──包裹──▶ BallistaPhysicalExtensionCod
 
 | 阶段 | 函数签名 | 说明 |
 |------|----------|------|
-| init | `fn(schema_ptr, schema_len) -> *mut c_void` | 接收输入 schema，返回处理器上下文指针 |
-| feed | `fn(ctx, input_ptr, input_len) -> i32` | 流式输入，每批调用一次，0=成功，负数=错误 |
+| init | `fn(schema_ptr, schema_len) -> *mut c_void` | 接收 schema (IPC 编码)，返回处理器上下文指针 |
+| feed | `fn(ctx, array: *mut FFI_ArrowArray) -> i32` | 流式输入 (Arrow C Data Interface 零拷贝) |
 | execute | `fn(ctx) -> i32` | 所有输入完成后执行业务逻辑 |
-| fetch | `fn(ctx, output_ptr, output_len) -> i32` | 流式输出，0=还有数据，1=结束，负数=错误 |
+| fetch | `fn(ctx, array: *mut FFI_ArrowArray) -> i32` | 流式输出 (Arrow C Data Interface 零拷贝)，0=还有数据，1=结束 |
 | finish | `fn(ctx) -> i32` | 释放处理器资源 |
 
-**流式设计的目的**：`feed` 逐批输入、`fetch` 逐批输出，框架同一时刻只持有一个 batch 的内存，最小化框架资源占用。
+**流式设计的目的**：`feed` 逐批输入、`fetch` 逐批输出。数据通过 Arrow C Data Interface (`FFI_ArrowArray`) 传递，框架与 .so 之间只传递指针和 Arc 引用计数，不产生数据拷贝。
 
 ### C ABI 接口详细说明
 
@@ -122,15 +122,15 @@ ExtendedBallistaPhysicalCodec ──包裹──▶ BallistaPhysicalExtensionCod
 // 初始化：传入 Arrow Schema 的 IPC 二进制，返回处理器上下文
 void* <fn_name>_init(const uint8_t* schema_ptr, int64_t schema_len);
 
-// 流式输入：传入 RecordBatch 的 IPC 二进制
-int32_t <fn_name>_feed(void* ctx, const uint8_t* input_ptr, int64_t input_len);
+// 流式输入：框架通过 to_ffi 导出 FFI_ArrowArray，.so 通过 from_ffi_and_data_type 导入
+// 框架侧用 Box 分配：SDK 的 from_raw 取走数据后将 *array 替换为 empty()
+int32_t <fn_name>_feed(void* ctx, FFI_ArrowArray* array);
 
 // 执行：所有输入完成后调用
 int32_t <fn_name>_execute(void* ctx);
 
-// 流式输出：框架分配 output_ptr/output_len，.so 需用 malloc 分配内存
-// 框架消费完后会调用 libc::free() 释放
-int32_t <fn_name>_fetch(void* ctx, uint8_t** output_ptr, int64_t* output_len);
+// 流式输出：框架预分配 FFI_ArrowArray::empty()，.so 通过 to_ffi 填充数据
+int32_t <fn_name>_fetch(void* ctx, FFI_ArrowArray* array);
 
 // 结束：释放处理器上下文
 int32_t <fn_name>_finish(void* ctx);
@@ -213,10 +213,12 @@ df.map_partition("/path/to/lib.so", "my_processor", Arc::new(output_schema))?
 
 ```rust
 pub trait PartitionProcessor: Send + Sized + 'static {
-    fn new(schema: SchemaRef) -> Self;      // 对应 _init
-    fn feed(&mut self, batch: RecordBatch); // 对应 _feed
-    fn execute(&mut self);                  // 对应 _execute
-    fn fetch(&mut self) -> Option<RecordBatch>; // 对应 _fetch
+    fn new(schema: SchemaRef) -> Self;           // 对应 _init
+    fn schema(&self) -> &SchemaRef;              // 供 _feed 构造输入 DataType
+    fn feed(&mut self, batch: RecordBatch);      // 对应 _feed
+    fn execute(&mut self);                       // 对应 _execute
+    fn fetch(&mut self) -> Option<RecordBatch>;  // 对应 _fetch
+    fn finish(&mut self) {}                      // 对应 _finish (可选)
 }
 ```
 
@@ -235,14 +237,14 @@ export_partition_processor!(MyProcessor, my_processor);
 
 生成的函数：`my_processor_init`, `my_processor_feed`, `my_processor_execute`, `my_processor_fetch`, `my_processor_finish`
 
-### IPC 帮助函数
+### SDK 帮助函数
 
-| 函数 | 说明 |
-|------|------|
-| `decode_schema(bytes)` | IPC bytes → SchemaRef |
-| `decode_batch(bytes)` | IPC bytes → RecordBatch |
-| `encode_schema(schema)` | SchemaRef → IPC bytes |
-| `encode_batch(batch)` | RecordBatch → IPC bytes |
+| 函数 | 说明 | 用途 |
+|------|------|------|
+| `decode_schema(bytes)` | IPC bytes → SchemaRef | `_init` |
+| `encode_schema(schema)` | SchemaRef → IPC bytes | 框架/逻辑节点 |
+| `import_batch_from_ffi(ptr, DataType)` | FFI_ArrowArray → RecordBatch | `_feed` (C Data Interface) |
+| `export_batch_to_ffi(batch, ptr)` | RecordBatch → FFI_ArrowArray | `_fetch` (C Data Interface) |
 
 
 ### 示例总览
@@ -330,104 +332,9 @@ MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
 
 ---
 
-### 3. 并发性能基准测试（bench_region_cluster_client）
+### 3. 并发性能基准测试
 
-验证 DistributeBy 三级并行模型的并发性能。
-
-**数据集参数**：
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| Region 数 | 1 | `-r` 参数指定 |
-| 每 Region channelid 数 | 100 | 即 100 个档案 |
-| 每 channelid 轨迹数 | 1,000 | |
-| JSON 大小 | 1KB | `-j` 参数指定（最小 32 字节） |
-| 分区数 | max(regions, 50) | 自动计算 |
-
-示例：`-r 50 -j 4096` 生成 50 × 100 × 1000 = 5,000,000 行，每行含 4KB json。
-
-**输入 Schema**：`(region, channelid, captime, recordid, json)`
-
-**输出 Schema**：`(region, dossierid, recordids, json1, json2, json3, json4)`，其中 json1-4 从该档案的轨迹中均匀采样。
-
-**流程**：
-1. 生成测试数据（内存构建 Arrow RecordBatch）
-2. 清理 S3 旧数据，写入 `s3://ballista/bench_region_face_capture/`
-3. 通过 Ballista 读取 S3 数据，执行 DistributeBy + map_partition 聚类
-4. 聚类结果由 Executor 端直接写入 `s3://ballista/bench_region_cluster_result/`
-5. 读回结果验证正确性（档案数、CROSS_REGION_ERROR 检测）
-
-**启动步骤**：
-
-```bash
-# 1. 启动 MinIO / Scheduler（如已启动可复用）
-
-# 2. 启动 Executor（支持命令行参数指定端口和并发数）
-
-#    单 Executor（8 并发）：
-cargo run --release --example distributed_compute_executor -- -p 50051 --bind-grpc-port 50052 -c 8
-
-#    多 Executor（各用不同端口）：
-cargo run --release --example distributed_compute_executor -- -p 50051 --bind-grpc-port 50052 -c 4 &
-cargo run --release --example distributed_compute_executor -- -p 50053 --bind-grpc-port 50054 -c 4 &
-
-# 3. 运行基准测试（自动生成数据、清理 S3、上传、计算、写回结果）
-#    默认：1 Region, 1KB JSON
-MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
-  cargo run --release --example bench_region_cluster_client
-
-#    50 Region, 4KB JSON
-MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
-  cargo run --release --example bench_region_cluster_client -- -r 50 -j 4096
-```
-
-**基准测试命令行参数**：
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `-r` / `--regions` | Region 数量 | 1 |
-| `-j` / `--json-size` | 每条轨迹 JSON 大小（字节） | 1024 |
-
-**Executor 命令行参数**：
-
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `-p` / `--port` | Arrow Flight 服务端口 | 50051 |
-| `--bind-grpc-port` | gRPC 服务端口 | 50052 |
-| `-c` / `--concurrent-tasks` | 并发任务数 | CPU 核数 |
-
-**基准测试结果对比**：
-
-| 配置 | 输入行数 | 数据集大小 | 计算耗时 | 吞吐量 | 资源说明 |
-|------|---------|-----------|---------|--------|---------|
-| 1 Executor × 8 concurrent (50 regions, 4KB) | 5,000,000 | ~20GB (IPC) | 14.33s | 348,954 rec/s | 见下方资源监控 |
-
-**测试条件**：
-- Region 数: 50，每 Region 100 个 channelid，每 channelid 1000 条轨迹
-- 每条轨迹含 4KB JSON，总数据量约 5,000,000 行
-- 分区数: 50（自动匹配 Region 数）
-- Executor 并发: 8（与 CPU 核数一致）
-
-**资源使用监控**：
-
-| 进程 | 空闲内存 | 峰值内存 (计算阶段) | CPU 使用率 |
-|------|---------|-------------------|-----------|
-| MinIO | ~183 MB | ~409 MB | <1%（稳态，数据读取为主） |
-| Scheduler | ~20 MB | ~70 MB | <1%（仅协调调度） |
-| Executor | ~21 MB | ~4.9 GB（.so 处理器加载轨迹数据） | 高负载（计算阶段） |
-| Bench Client | — | 瞬时（仅生成数据 + 提交任务） | — |
-
-内存随时间变化（Executor 侧）：
-```
-计算前   →  数据加载中   →  峰值       →  finish 后
-~21 MB  →  3.1 GB      →  4.9 GB   →  ~892 MB
-```
-
-**分析**：
-- Executor 内存峰值 ~4.9GB，主要消耗在 `.so` 处理器内部加载 5,000,000 条轨迹数据。每个 region 的 processor 持有全部轨迹做聚类，50 个 region 串行执行时峰值约 4.9GB
-- MinIO 和 Scheduler 资源消耗极低，说明性能瓶颈在 Executor 端的内存和计算
-- 数据生成 + S3 写入耗时 12.29s，分布式计算耗时 14.33s，两者接近，计算效率较高
-- 计算完成后 Executor 内存回落到 ~892MB（部分缓存未完全释放，`malloc_trim` 已调用）
+详见 [PERF.md](./PERF.md)。
 
 ---
 
@@ -436,6 +343,11 @@ MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
 ```bash
 docker stop minio
 ```
+
+## 相关文档
+
+- [设计文档](design.md) — 架构设计细节：S3 集成、DistributeBy 分区语义、C Data Interface 零拷贝方案、SDK 架构
+- [性能压测报告](PERF.md) — 基准测试流程、结果对比与内存分析
 
 ## 版本兼容
 

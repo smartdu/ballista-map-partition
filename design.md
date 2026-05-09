@@ -195,3 +195,130 @@ plan.transform_up(&|node: Arc<dyn ExecutionPlan>| {
 - 设 `>= 不同值数`：每个分区大概率只有 1 个值，1 个 processor 实例
 - 设 `< 不同值数`：必然有 pigeonhole 碰撞，同分区多个 processor，并行度浪费
 - 内部 grouping 兜底保正确性，但不应依赖它做主要分发
+
+---
+
+## 3. Arrow C Data Interface（零拷贝 FFI）
+
+### 为什么替换 IPC
+
+旧版方案使用 Arrow IPC Stream 格式在框架↔`.so` 之间序列化/反序列化 RecordBatch：
+
+```
+框架 RecordBatch → IPC bytes → .so 接收 bytes → IPC 解码 → RecordBatch
+```
+
+每个 batch 在 FFI 边界产生 **3 份内存拷贝**（原始 Arrow 数据 + IPC 字节 + 解码后的数据），导致：
+- Executor 峰值内存膨胀约 20-35%
+- CPU 消耗在序列化/反序列化上
+
+### C Data Interface 方案
+
+使用 Arrow 标准的 C Data Interface（`FFI_ArrowArray`）替代 IPC 字节流，通过 `Arc` 引用计数实现零拷贝传递：
+
+```
+框架 RecordBatch → to_ffi() → FFI_ArrowArray → .so from_ffi_and_data_type() → RecordBatch
+                                    ↕
+                          指针传递，Arc 引用计数，无数据拷贝
+```
+
+数据实际在共享的 Arrow Buffer 中，`Buffer::clone()` 只增加 `Arc` 引用计数，不复制数据。
+
+### _feed 方向：框架→.so
+
+```
+┌─────────────────────────────────────┐    ┌──────────────────────────────┐
+│ 框架 (arrow 57)                      │    │ .so SDK (arrow 54)           │
+│                                      │    │                              │
+│ RecordBatch                          │    │ FFI_ArrowArray::from_raw(ptr)│
+│   → StructArray::from(batch)         │    │   // 取走所有权，*ptr ← empty│
+│   → to_ffi(&data) → FFI_ArrowArray   │    │ from_ffi_and_data_type(arr)  │
+│   → Box::new(ffi_array)              │    │   → ArrayData                │
+│   → Box::into_raw() → *mut ptr       │    │   → StructArray → RecordBatch│
+│               ↓                      │    │                              │
+│        feed_func(ctx, ptr) ──────────┼───→│ processor.feed(batch)        │
+│                                      │    │                              │
+│ // *ptr 已被 SDK 替换为 empty()       │    │                              │
+│ Box::from_raw(ptr) → drop (安全)     │    │                              │
+└─────────────────────────────────────┘    └──────────────────────────────┘
+```
+
+1. 框架用 `StructArray::from(batch)` 将 RecordBatch 重新包装为 StructArray（零拷贝，只移 ownership）
+2. `to_ffi(&data)` 创建 FFI_ArrowArray，内部 `private_data` 持有 `Buffer::clone()`（Arc 自增）
+3. `Box::new(ffi_array)` 将 FFI_ArrowArray 移到堆上，`Box::into_raw()` 取得裸指针
+4. SDK 的 `_feed` 调用 `FFI_ArrowArray::from_raw(ptr)` → `std::ptr::replace(ptr, empty())` 取走数据
+5. 框架的 `ptr` 指向空结构（`release: None`），回收 Box 后安全 drop
+
+### _fetch 方向：.so→框架
+
+```
+┌─────────────────────────────────────┐    ┌──────────────────────────────┐
+│ 框架 (arrow 57)                      │    │ .so SDK (arrow 54)           │
+│                                      │    │                              │
+│ let mut arr = FFI_ArrowArray::empty()│    │ processor.fetch()            │
+│               ↓                      │    │   → Some(batch)              │
+│  fetch_func(ctx, &mut arr) ──────────┼───→│ to_ffi(&data) → FFI_ArrowArray│
+│                                      │    │ ptr::write(array_ptr, arr)   │
+│ // &mut arr 已被 SDK 填充             │    │ // 写入框架预分配的槽位        │
+│                                      │    │                              │
+│ from_ffi_and_data_type(arr, type)    │    │                              │
+│   → ArrayData → RecordBatch          │    │                              │
+└─────────────────────────────────────┘    └──────────────────────────────┘
+```
+
+1. 框架在栈上创建 `FFI_ArrowArray::empty()`（`release: None`）
+2. SDK 的 `_fetch` 调用 `to_ffi()` 导出数据，`ptr::write(ptr, ffi_array)` 写入框架的栈槽位
+3. 框架调用 `from_ffi_and_data_type(arr, data_type)` 导入 ArrayData → RecordBatch
+
+### 跨版本 Arrow 兼容
+
+`.so` 处理器使用 arrow 54（SDK），框架使用 arrow 57（DataFusion 52）。`FFI_ArrowArray` 是 `#[repr(C)]` 结构体，两个版本的字段布局完全相同，ABI 安全。
+
+Release 回调是函数指针——消费者只负责调用生产者设置的函数指针，与版本无关。
+
+### 效果
+
+| 指标 | IPC (旧) | C Data Interface (新) |
+|------|---------|---------------------|
+| 框架↔.so 数据传输 | IPC 序列化字节 | `Arc` 引用计数指针 |
+| 每 batch 内存额外开销 | ~2× batch 大小 (IPC 编码+解码) | 0（零拷贝） |
+| Executor 内存峰值 | ~4.9 GB | ~4.3 GB |
+| 计算耗时 (5M 行) | 14.33s | 11.18s |
+
+---
+
+## 4. SDK 架构
+
+### PartitionProcessor trait
+
+```rust
+pub trait PartitionProcessor: Send + Sized + 'static {
+    fn new(schema: SchemaRef) -> Self;
+    fn schema(&self) -> &SchemaRef;  // 供 _feed 构造 DataType::Struct
+    fn feed(&mut self, batch: RecordBatch);
+    fn execute(&mut self);
+    fn fetch(&mut self) -> Option<RecordBatch>;
+    fn finish(&mut self) {}  // 默认空实现
+}
+```
+
+`_finish` 由 SDK 自动实现（drop 处理器并释放 FFI 资源）；用户只需实现 trait。
+
+### export_partition_processor! 宏
+
+生成 5 个 `extern "C"` 函数：
+
+| 函数 | 签名 | 数据格式 |
+|------|------|---------|
+| `_init` | `(schema_ptr, schema_len) -> *mut c_void` | Schema: IPC bytes |
+| `_feed` | `(ctx, *mut FFI_ArrowArray) -> i32` | Batch: C Data Interface |
+| `_execute` | `(ctx) -> i32` | — |
+| `_fetch` | `(ctx, *mut FFI_ArrowArray) -> i32` | Batch: C Data Interface |
+| `_finish` | `(ctx) -> i32` | — |
+
+### Processor 设计约束
+
+1. 不要在 `feed()` 中缓存整个 batch 的原始数据——只存储聚合所需的派生状态
+2. 大字段（JSON、binary）如非必要，在 `feed()` 中提取关键字段后丢弃原始数据
+3. `execute()` 做计算，`fetch()` 流式输出——不要在 `fetch()` 中返回单个巨大 batch
+4. 跨版本编译：.so 用 arrow 54 编译，框架用 arrow 57，通过 C Data Interface 互操作

@@ -21,6 +21,8 @@ use map_partition_sdk::{PartitionProcessor, export_partition_processor};
 ///   3. One dossier per unique channelid, recordids joined by comma
 ///   4. json1-4 are randomly sampled from the input trajectories' json field
 struct RegionClusterProcessor {
+    /// Input schema (used for FFI record batch decoding)
+    input_schema: SchemaRef,
     /// channelid -> list of (recordid, json)
     clusters: HashMap<String, Vec<(String, String)>>,
     /// The region value seen so far (first non-null region)
@@ -86,14 +88,19 @@ fn sample_jsons(recs: &[(String, String)]) -> (String, String, String, String) {
 }
 
 impl PartitionProcessor for RegionClusterProcessor {
-    fn new(_schema: SchemaRef) -> Self {
+    fn new(schema: SchemaRef) -> Self {
         Self {
+            input_schema: schema,
             clusters: HashMap::new(),
             observed_region: None,
             cross_region_error: false,
             output_rows: Vec::new(),
             output_index: 0,
         }
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.input_schema
     }
 
     fn feed(&mut self, batch: RecordBatch) {

@@ -6,6 +6,6 @@ license = "MIT"
 description = "SDK for developing MapPartition .so processors for Ballista"
 
 [dependencies]
-arrow = { version = "54" }
+arrow = { version = "54", features = ["ffi"] }
 arrow-ipc = { version = "54" }
 paste = "1"

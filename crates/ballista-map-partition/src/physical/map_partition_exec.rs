@@ -1,12 +1,11 @@
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{BooleanArray, Array};
+use datafusion::arrow::array::{BooleanArray, Array, StructArray};
 use datafusion::arrow::compute::filter_record_batch;
-use datafusion::arrow::datatypes::{Schema, SchemaRef};
-use datafusion::arrow::ipc::reader::StreamReader;
+use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
+use datafusion::arrow::ffi::{FFI_ArrowArray, from_ffi_and_data_type, to_ffi};
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
@@ -32,31 +31,6 @@ pub fn encode_schema_to_ipc(schema: &Schema) -> Result<Vec<u8>, DataFusionError>
         .finish()
         .map_err(|e| DataFusionError::Internal(format!("failed to finish schema IPC writer: {e}")))?;
     Ok(buf)
-}
-
-fn encode_batch_to_ipc(batch: &RecordBatch) -> Result<Vec<u8>, DataFusionError> {
-    let mut buf = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut buf, &batch.schema())
-        .map_err(|e| DataFusionError::Internal(format!("failed to create batch IPC writer: {e}")))?;
-    writer
-        .write(batch)
-        .map_err(|e| DataFusionError::Internal(format!("failed to write batch IPC: {e}")))?;
-    writer
-        .finish()
-        .map_err(|e| DataFusionError::Internal(format!("failed to finish batch IPC writer: {e}")))?;
-    Ok(buf)
-}
-
-fn decode_ipc_to_batch(bytes: &[u8]) -> Result<RecordBatch, DataFusionError> {
-    let reader = StreamReader::try_new(Cursor::new(bytes), None)
-        .map_err(|e| DataFusionError::Internal(format!("failed to create IPC reader: {e}")))?;
-    let batches: Vec<RecordBatch> = reader
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| DataFusionError::Internal(format!("failed to read IPC batches: {e}")))?;
-    batches
-        .into_iter()
-        .next()
-        .ok_or_else(|| DataFusionError::Internal("no batch in IPC output".to_string()))
 }
 
 /// Wrapper to make raw pointers Send-safe within our spawned task.
@@ -313,7 +287,7 @@ impl ExecutionPlan for MapPartitionExec {
                 // Get _feed symbol
                 let feed_name = format!("{fn_name}_feed");
                 let feed_func: libloading::Symbol<
-                    unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, i64) -> i32,
+                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut FFI_ArrowArray) -> i32,
                 > = unsafe {
                     lib.get(feed_name.as_bytes()).map_err(|e| {
                         DataFusionError::Internal(format!("symbol {feed_name} not found: {e}"))
@@ -332,7 +306,7 @@ impl ExecutionPlan for MapPartitionExec {
                 // Get _fetch symbol
                 let fetch_name = format!("{fn_name}_fetch");
                 let fetch_func: libloading::Symbol<
-                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut u8, *mut i64) -> i32,
+                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut FFI_ArrowArray) -> i32,
                 > = unsafe {
                     lib.get(fetch_name.as_bytes()).map_err(|e| {
                         DataFusionError::Internal(format!("symbol {fetch_name} not found: {e}"))
@@ -374,11 +348,16 @@ impl ExecutionPlan for MapPartitionExec {
                         }
 
                         let processor = processors.get_mut(&key).unwrap();
-                        let input_bytes = encode_batch_to_ipc(&sub_batch)?;
+                        // Export batch via C Data Interface (zero-copy)
+                        let struct_array = StructArray::from(sub_batch);
+                        let data = struct_array.into_data();
+                        let (ffi_array, _) = to_ffi(&data)?;
+                        let ffi_box = Box::new(ffi_array);
+                        let ptr = Box::into_raw(ffi_box);
 
-                        let rc = unsafe {
-                            feed_func(processor.so_ctx.ctx, input_bytes.as_ptr(), input_bytes.len() as i64)
-                        };
+                        let rc = unsafe { feed_func(processor.so_ctx.ctx, ptr) };
+                        // SDK's from_raw replaced *ptr with empty(); reclaim the Box safely
+                        let _ = unsafe { Box::from_raw(ptr) };
                         if rc != 0 {
                             return Err(DataFusionError::Internal(format!(
                                 "{feed_name} returned error code {rc} for key {key:?}"
@@ -399,15 +378,16 @@ impl ExecutionPlan for MapPartitionExec {
                 }
 
                 // ---- Phase 5: _fetch (serial, ordered by key) ----
+                let output_data_type = DataType::Struct(output_schema.fields().clone());
                 for key in &key_order {
                     let processor = processors.get_mut(key).unwrap();
                     loop {
-                        // Scope raw pointer usage before .await to satisfy Send
-                        let (output_batch, status) = {
-                            let mut output_ptr: *mut u8 = std::ptr::null_mut();
-                            let mut output_len: i64 = 0;
-
-                            let status = unsafe { fetch_func(processor.so_ctx.ctx, &mut output_ptr, &mut output_len) };
+                        // Scope FFI_ArrowArray before .await to satisfy Send
+                        let output_batch = {
+                            let mut ffi_array = FFI_ArrowArray::empty();
+                            let status = unsafe {
+                                fetch_func(processor.so_ctx.ctx, &mut ffi_array as *mut FFI_ArrowArray)
+                            };
 
                             if status < 0 {
                                 return Err(DataFusionError::Internal(format!(
@@ -415,25 +395,21 @@ impl ExecutionPlan for MapPartitionExec {
                                 )));
                             }
 
-                            if output_ptr.is_null() || output_len == 0 {
-                                (None, status)
+                            if status == 1 {
+                                None // no more data
                             } else {
-                                let output_bytes =
-                                    unsafe { std::slice::from_raw_parts(output_ptr, output_len as usize) };
-                                let batch = decode_ipc_to_batch(output_bytes)?;
-                                unsafe { libc::free(output_ptr as *mut libc::c_void) };
-                                (Some(batch), status)
+                                // status == 0: data was written to ffi_array
+                                let array_data = unsafe {
+                                    from_ffi_and_data_type(ffi_array, output_data_type.clone())
+                                }.map_err(|e| DataFusionError::Internal(format!("from_ffi_and_data_type: {e}")))?;
+                                let struct_array = StructArray::from(array_data);
+                                Some(RecordBatch::from(struct_array))
                             }
                         };
 
-                        if let Some(batch) = output_batch {
-                            tx.send(Ok(batch)).await.unwrap();
-                        } else {
-                            break;
-                        }
-
-                        if status == 1 {
-                            break; // last batch for this processor
+                        match output_batch {
+                            Some(batch) => tx.send(Ok(batch)).await.unwrap(),
+                            None => break, // status == 1: done
                         }
                     }
                 }
@@ -473,7 +449,7 @@ impl ExecutionPlan for MapPartitionExec {
                 // ---- Phase 3: _feed (streaming input) ----
                 let feed_name = format!("{fn_name}_feed");
                 let feed_func: libloading::Symbol<
-                    unsafe extern "C" fn(*mut std::ffi::c_void, *const u8, i64) -> i32,
+                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut FFI_ArrowArray) -> i32,
                 > = unsafe {
                     lib.get(feed_name.as_bytes()).map_err(|e| {
                         DataFusionError::Internal(format!("symbol {feed_name} not found: {e}"))
@@ -482,13 +458,16 @@ impl ExecutionPlan for MapPartitionExec {
 
                 while let Some(batch) = input_stream.next().await {
                     let batch = batch?;
-                    let input_bytes = encode_batch_to_ipc(&batch)?;
+                    // Export batch via C Data Interface (zero-copy)
+                    let struct_array = StructArray::from(batch);
+                    let data = struct_array.into_data();
+                    let (ffi_array, _) = to_ffi(&data)?;
+                    let ffi_box = Box::new(ffi_array);
+                    let ptr = Box::into_raw(ffi_box);
 
-                    drop(batch);
-
-                    let rc = unsafe {
-                        feed_func(so_ctx.ctx, input_bytes.as_ptr(), input_bytes.len() as i64)
-                    };
+                    let rc = unsafe { feed_func(so_ctx.ctx, ptr) };
+                    // SDK's from_raw replaced *ptr with empty(); reclaim the Box safely
+                    let _ = unsafe { Box::from_raw(ptr) };
                     if rc != 0 {
                         return Err(DataFusionError::Internal(format!(
                             "{feed_name} returned error code {rc}"
@@ -515,18 +494,20 @@ impl ExecutionPlan for MapPartitionExec {
                 // ---- Phase 5: _fetch (streaming output) ----
                 let fetch_name = format!("{fn_name}_fetch");
                 let fetch_func: libloading::Symbol<
-                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut *mut u8, *mut i64) -> i32,
+                    unsafe extern "C" fn(*mut std::ffi::c_void, *mut FFI_ArrowArray) -> i32,
                 > = unsafe {
                     lib.get(fetch_name.as_bytes()).map_err(|e| {
                         DataFusionError::Internal(format!("symbol {fetch_name} not found: {e}"))
                     })?
                 };
 
+                let output_data_type = DataType::Struct(output_schema.fields().clone());
                 loop {
-                    let (output_batch, status) = {
-                        let mut output_ptr: *mut u8 = std::ptr::null_mut();
-                        let mut output_len: i64 = 0;
-                        let status = unsafe { fetch_func(so_ctx.ctx, &mut output_ptr, &mut output_len) };
+                    let output_batch = {
+                        let mut ffi_array = FFI_ArrowArray::empty();
+                        let status = unsafe {
+                            fetch_func(so_ctx.ctx, &mut ffi_array as *mut FFI_ArrowArray)
+                        };
 
                         if status < 0 {
                             return Err(DataFusionError::Internal(format!(
@@ -534,25 +515,20 @@ impl ExecutionPlan for MapPartitionExec {
                             )));
                         }
 
-                        if output_ptr.is_null() || output_len == 0 {
-                            (None, status)
+                        if status == 1 {
+                            None // no more data
                         } else {
-                            let output_bytes =
-                                unsafe { std::slice::from_raw_parts(output_ptr, output_len as usize) };
-                            let batch = decode_ipc_to_batch(output_bytes)?;
-                            unsafe { libc::free(output_ptr as *mut libc::c_void) };
-                            (Some(batch), status)
+                            let array_data = unsafe {
+                                from_ffi_and_data_type(ffi_array, output_data_type.clone())
+                            }.map_err(|e| DataFusionError::Internal(format!("from_ffi_and_data_type: {e}")))?;
+                            let struct_array = StructArray::from(array_data);
+                            Some(RecordBatch::from(struct_array))
                         }
                     };
 
-                    if let Some(batch) = output_batch {
-                        tx.send(Ok(batch)).await.unwrap();
-                    } else {
-                        break;
-                    }
-
-                    if status == 1 {
-                        break; // last batch
+                    match output_batch {
+                        Some(batch) => tx.send(Ok(batch)).await.unwrap(),
+                        None => break, // status == 1: done
                     }
                 }
 

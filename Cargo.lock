@@ -524,6 +524,9 @@ name = "arrow-schema"
 version = "54.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cfaf5e440be44db5413b75b72c2a87c1f8f0627117d110264048f2969b99e9"
+dependencies = [
+ "bitflags 2.11.1",
+]
 
 [[package]]
 name = "arrow-schema"
@@ -531,6 +534,7 @@ version = "57.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c872d36b7bf2a6a6a2b40de9156265f0242910791db366a2c17476ba8330d68"
 dependencies = [
+ "bitflags 2.11.1",
  "serde_core",
  "serde_json",
 ]
@@ -1158,7 +1162,7 @@ dependencies = [
 name = "ballista-map-partition"
 version = "0.1.0"
 dependencies = [
- "arrow-ipc 54.3.1",
+ "arrow 57.3.0",
  "async-trait",
  "ballista",
  "ballista-core",
