@@ -64,16 +64,7 @@ ballista-map-partition/
 │       │   ├── ipc.rs                  # Arrow IPC 编解码
 │       │   └── export.rs               # export_partition_processor! 宏
 │       └── examples/
-│           └── region_cluster_processor/ # .so 处理器：按 channelid 聚类
-│   └── ballista-monitor/               # 内置监控系统
-│       └── src/
-│           ├── lib.rs                  # 模块导出
-│           ├── registry.rs             # 全局 MetricsRegistry 单例
-│           ├── collector.rs            # 系统指标采集（1s 间隔）
-│           ├── metrics.rs              # 指标数据结构
-│           ├── store.rs                # RingBuffer 时序存储
-│           ├── server.rs               # axum HTTP 服务
-│           └── dashboard.rs            # 嵌入式 Web Dashboard
+│           └── region_cluster_processor/ # .so 处理器示例
 ```
 
 ## 七层扩展管线
@@ -253,94 +244,6 @@ export_partition_processor!(MyProcessor, my_processor);
 | `encode_schema(schema)` | SchemaRef → IPC bytes |
 | `encode_batch(batch)` | RecordBatch → IPC bytes |
 
-## 内置监控系统
-
-项目内置了实时监控系统（`ballista-monitor` crate），可通过 Web 页面监控 Scheduler 和 Executor 的运行状态。
-
-### 编译
-
-监控功能通过 `monitoring` feature flag 控制：
-
-```bash
-# 构建时启用监控
-cargo build --release --examples --features monitoring
-```
-
-### 启动
-
-Scheduler 和 Executor 各自新增 `--monitor-port` 参数：
-
-```bash
-# Scheduler（默认监控端口 8080）
-cargo run --release --example distributed_compute_scheduler --features monitoring -- --monitor-port 8080
-
-# Executor（默认监控端口 8081）
-cargo run --release --example distributed_compute_executor --features monitoring -- --monitor-port 8081
-```
-
-启动后日志中会打印 `Monitor server listening on http://0.0.0.0:8080`。
-
-### Web Dashboard
-
-浏览器访问 `http://<executor-host>:8081` 打开监控页面。
-
-**Overview 页面**：展示所有节点的概览卡片，包括 CPU、Memory、Disk、Uptime 等指标。Executor 额外显示 SO Processors（活跃/历史总数）和 Concurrent（并发槽位数）。
-
-**节点详情页**：点击 Overview 卡片或顶部 Tab 进入，展示：
-- **CPU / Memory 时序图表**
-- **Top 10 Slowest Processors**：跨所有 Job 的耗时排行榜，按 Stages Total 降序排列
-- **Processors 分组列表**：按 Job ID 分组，可折叠/展开，显示 SO 文件名、函数名、Partition、Key、Stage、创建/结束时间、I/O 统计
-- **Processor 详情弹窗**：点击行弹出，显示：
-  - Job ID、SO 文件名、函数名、Partition、Key、Stage
-  - 创建时间、结束时间
-  - Lifecycle（挂钟总耗时）、Stages Total（各阶段 CPU 耗时之和）、Wait/Overhead（等待开销）
-  - Stage Breakdown 彩色条形图（init / feed / execute / fetch / finish 各阶段耗时占比）
-  - 各阶段明细表（调用次数、总耗时、平均耗时、占比）
-  - I/O 统计（输入/输出的行数和字节数）
-
-**多节点聚合**：点击右上角齿轮按钮配置多个节点的 URL，页面自动轮询所有节点数据，统一展示。
-
-### 监控架构
-
-```
-┌──────────────────────────────────────────────────────┐
-│                   Browser (Dashboard)                 │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐     │
-│  │  Overview   │  │ Scheduler  │  │ Executor   │     │
-│  │  (全部节点) │  │  Detail    │  │  Detail    │     │
-│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘     │
-│        │               │               │             │
-│        └───────────────┼───────────────┘             │
-│                        │ 5s 轮询 /api/*              │
-└────────────────────────┼─────────────────────────────┘
-                         │
-           ┌─────────────┼─────────────┐
-           ▼             ▼             ▼
-    ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-    │ Scheduler   │ │ Executor 1  │ │ Executor 2  │
-    │ :8080       │ │ :8081       │ │ :8082       │
-    │ (axum +     │ │ (axum +     │ │ (axum +     │
-    │  CORS)      │ │  CORS)      │ │  CORS)      │
-    └─────────────┘ └─────────────┘ └─────────────┘
-```
-
-- 每个进程内嵌 axum HTTP 服务，提供 REST API
-- 启用 CORS 允许浏览器跨节点拉取数据
-- 系统指标（CPU/Memory/Disk/Network）每秒采样，保留 5 分钟时序数据
-- .so Processor 生命周期（init → feed → execute → fetch → finish）全程追踪，含各阶段耗时
-- 自动清理过期数据：每 60 秒清理超过 10 分钟无活动的 processor 和 metric 条目，避免内存泄漏
-
-### API 端点
-
-| 端点 | 说明 |
-|------|------|
-| `GET /` | Dashboard HTML 页面 |
-| `GET /api/overview` | 节点概览（角色、指标、processor 统计） |
-| `GET /api/metrics` | 所有指标最新值 |
-| `GET /api/metrics/{name}/history?since=unix_ms` | 指标时序数据 |
-| `GET /api/processors` | 所有 processor 详情（含 stage_durations） |
-
-## 示例与测试
 
 ### 示例总览
 

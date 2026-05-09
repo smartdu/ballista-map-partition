@@ -71,8 +71,6 @@ unsafe impl Send for SoContext {}
 /// Used when distribute_by is set to group rows by key within a partition.
 struct GroupProcessor {
     so_ctx: SoContext,
-    #[cfg(feature = "monitoring")]
-    monitor_id: String,
 }
 
 /// Split a RecordBatch into sub-batches grouped by the distribute_by key.
@@ -162,54 +160,6 @@ fn compute_properties(
         EmissionType::Incremental,
         Boundedness::Bounded,
     )
-}
-
-// ---- Monitoring helpers (only compiled with `monitoring` feature) ----
-
-#[cfg(feature = "monitoring")]
-fn monitor_labels(partition: usize, so_path: &str, _key: Option<&str>) -> HashMap<String, String> {
-    let mut labels = HashMap::new();
-    labels.insert("partition".to_string(), partition.to_string());
-    labels.insert("so_path".to_string(), so_path.to_string());
-    // Note: key is intentionally excluded to avoid metric cardinality explosion.
-    // Per-key data is tracked via ProcessorInfo instead.
-    labels
-}
-
-#[cfg(feature = "monitoring")]
-fn monitor_record_histogram(name: &str, value: f64, labels: HashMap<String, String>) {
-    let registry = ballista_monitor::MetricsRegistry::global();
-    registry.lock().unwrap().record_histogram(name, value, labels);
-}
-
-#[cfg(feature = "monitoring")]
-fn monitor_increment_counter(name: &str, delta: f64, labels: HashMap<String, String>) {
-    let registry = ballista_monitor::MetricsRegistry::global();
-    registry.lock().unwrap().increment_counter(name, delta, labels);
-}
-
-#[cfg(feature = "monitoring")]
-fn monitor_log(level: &str, stage: &str, message: &str, labels: HashMap<String, String>) {
-    let registry = ballista_monitor::MetricsRegistry::global();
-    registry.lock().unwrap().log(level, stage, message, labels);
-}
-
-#[cfg(feature = "monitoring")]
-fn monitor_add_processor(job_id: &str, so_path: &str, fn_name: &str, partition: usize, key: Option<&str>, init_duration_ms: f64) -> String {
-    let registry = ballista_monitor::MetricsRegistry::global();
-    registry.lock().unwrap().add_processor(job_id, so_path, fn_name, partition, key, init_duration_ms)
-}
-
-#[cfg(feature = "monitoring")]
-fn monitor_update_processor(id: &str, stage: &str, rows_in: u64, rows_out: u64, bytes_in: u64, bytes_out: u64, duration_ms: f64) {
-    let registry = ballista_monitor::MetricsRegistry::global();
-    registry.lock().unwrap().update_processor(id, stage, rows_in, rows_out, bytes_in, bytes_out, duration_ms);
-}
-
-#[cfg(feature = "monitoring")]
-fn monitor_finish_processor(id: &str, duration_ms: f64) {
-    let registry = ballista_monitor::MetricsRegistry::global();
-    registry.lock().unwrap().finish_processor(id, duration_ms);
 }
 
 #[derive(Debug)]
@@ -330,8 +280,6 @@ impl ExecutionPlan for MapPartitionExec {
         partition: usize,
         context: std::sync::Arc<datafusion::execution::TaskContext>,
     ) -> datafusion::error::Result<SendableRecordBatchStream> {
-        #[cfg(feature = "monitoring")]
-        let job_id = context.session_id();
         let mut input_stream = self.input.execute(partition, context)?;
         let so_path = self.so_path.clone();
         let fn_name = self.fn_name.clone();
@@ -342,9 +290,6 @@ impl ExecutionPlan for MapPartitionExec {
         let tx = builder.tx();
 
         builder.spawn(async move {
-            #[cfg(feature = "monitoring")]
-            let partition_start = std::time::Instant::now();
-
             // ---- Phase 1: dlopen .so ----
             let lib = unsafe {
                 libloading::Library::new(&so_path).map_err(|e| {
@@ -418,119 +363,47 @@ impl ExecutionPlan for MapPartitionExec {
                     for (key, sub_batch) in sub_batches {
                         // Lazy init: create processor on first encounter of this key
                         if !processors.contains_key(&key) {
-                            #[cfg(feature = "monitoring")]
-                            let t_init = std::time::Instant::now();
-
                             let raw_ctx = unsafe {
                                 init_func(input_schema_bytes.as_ptr(), input_schema_bytes.len() as i64)
                             };
 
-                            #[cfg(feature = "monitoring")]
-                            let key_str = format!("{key:?}");
-                            #[cfg(feature = "monitoring")]
-                            let init_dur = t_init.elapsed().as_secs_f64() * 1000.0;
-                            #[cfg(feature = "monitoring")]
-                            let monitor_id = monitor_add_processor(&job_id, &so_path, &fn_name, partition, Some(&key_str), init_dur);
                             processors.insert(key.clone(), GroupProcessor {
                                 so_ctx: SoContext { ctx: raw_ctx },
-                                #[cfg(feature = "monitoring")]
-                                monitor_id,
                             });
                             key_order.push(key.clone());
-
-                            #[cfg(feature = "monitoring")]
-                            {
-                                let labels = monitor_labels(partition, &so_path, Some(&key_str));
-                                monitor_record_histogram("so_init_duration_ms", init_dur, labels.clone());
-                                monitor_log("info", "init", &format!("partition={partition} key={key_str} initialized"), labels);
-                            }
                         }
-
-                        #[cfg(feature = "monitoring")]
-                        let monitor_id = processors.get(&key).unwrap().monitor_id.clone();
 
                         let processor = processors.get_mut(&key).unwrap();
                         let input_bytes = encode_batch_to_ipc(&sub_batch)?;
-
-                        #[cfg(feature = "monitoring")]
-                        let t_feed = std::time::Instant::now();
-                        #[cfg(feature = "monitoring")]
-                        let feed_rows = sub_batch.num_rows() as u64;
-                        #[cfg(feature = "monitoring")]
-                        let feed_bytes = input_bytes.len() as u64;
 
                         let rc = unsafe {
                             feed_func(processor.so_ctx.ctx, input_bytes.as_ptr(), input_bytes.len() as i64)
                         };
                         if rc != 0 {
-                            #[cfg(feature = "monitoring")]
-                            {
-                                let labels = monitor_labels(partition, &so_path, Some(&format!("{key:?}")));
-                                monitor_increment_counter("so_error_count", 1.0, labels);
-                                monitor_log("error", "feed", &format!("partition={partition} key={key:?} error code {rc}"), monitor_labels(partition, &so_path, Some(&format!("{key:?}"))));
-                            }
                             return Err(DataFusionError::Internal(format!(
                                 "{feed_name} returned error code {rc} for key {key:?}"
                             )));
-                        }
-
-                        #[cfg(feature = "monitoring")]
-                        {
-                            let key_str = format!("{key:?}");
-                            let feed_dur = t_feed.elapsed().as_secs_f64() * 1000.0;
-                            let labels = monitor_labels(partition, &so_path, Some(&key_str));
-                            monitor_record_histogram("so_feed_duration_ms", feed_dur, labels.clone());
-                            monitor_increment_counter("so_feed_input_rows", feed_rows as f64, labels.clone());
-                            monitor_increment_counter("so_feed_input_bytes", feed_bytes as f64, labels);
-                            monitor_update_processor(&monitor_id, "feed", feed_rows, 0, feed_bytes, 0, feed_dur);
                         }
                     }
                 }
 
                 // ---- Phase 4: _execute (serial for all processors, in key order) ----
                 for key in &key_order {
-                    #[cfg(feature = "monitoring")]
-                    let t_exec = std::time::Instant::now();
-
                     let processor = processors.get_mut(key).unwrap();
                     let rc = unsafe { exec_func(processor.so_ctx.ctx) };
                     if rc != 0 {
-                        #[cfg(feature = "monitoring")]
-                        {
-                            let labels = monitor_labels(partition, &so_path, Some(&format!("{key:?}")));
-                            monitor_increment_counter("so_error_count", 1.0, labels);
-                        }
                         return Err(DataFusionError::Internal(format!(
                             "{exec_name} returned error code {rc} for key {key:?}"
                         )));
                     }
-
-                    #[cfg(feature = "monitoring")]
-                    {
-                        let key_str = format!("{key:?}");
-                        let exec_dur = t_exec.elapsed().as_secs_f64() * 1000.0;
-                        let labels = monitor_labels(partition, &so_path, Some(&key_str));
-                        monitor_record_histogram("so_execute_duration_ms", exec_dur, labels.clone());
-                        monitor_update_processor(&processors.get(key).unwrap().monitor_id, "execute", 0, 0, 0, 0, exec_dur);
-                        monitor_log("info", "execute", &format!("partition={partition} key={key_str} executed"), labels);
-                    }
                 }
 
                 // ---- Phase 5: _fetch (serial, ordered by key) ----
-                #[cfg(feature = "monitoring")]
-                let mut _total_output_rows: u64 = 0;
-                #[cfg(feature = "monitoring")]
-                let mut _total_output_bytes: u64 = 0;
-
                 for key in &key_order {
-                    #[cfg(feature = "monitoring")]
-                    let monitor_id = processors.get(key).unwrap().monitor_id.clone();
                     let processor = processors.get_mut(key).unwrap();
                     loop {
-                        #[cfg(feature = "monitoring")]
-                        let t_fetch = std::time::Instant::now();
                         // Scope raw pointer usage before .await to satisfy Send
-                        let (output_batch, status, out_rows, out_bytes) = {
+                        let (output_batch, status) = {
                             let mut output_ptr: *mut u8 = std::ptr::null_mut();
                             let mut output_len: i64 = 0;
 
@@ -543,30 +416,15 @@ impl ExecutionPlan for MapPartitionExec {
                             }
 
                             if output_ptr.is_null() || output_len == 0 {
-                                (None, status, 0u64, 0u64)
+                                (None, status)
                             } else {
                                 let output_bytes =
                                     unsafe { std::slice::from_raw_parts(output_ptr, output_len as usize) };
                                 let batch = decode_ipc_to_batch(output_bytes)?;
-                                let out_rows = batch.num_rows() as u64;
-                                let out_bytes = output_len as u64;
                                 unsafe { libc::free(output_ptr as *mut libc::c_void) };
-                                (Some(batch), status, out_rows, out_bytes)
+                                (Some(batch), status)
                             }
                         };
-
-                        #[cfg(feature = "monitoring")]
-                        if output_batch.is_some() {
-                            let key_str = format!("{key:?}");
-                            let fetch_dur = t_fetch.elapsed().as_secs_f64() * 1000.0;
-                            let labels = monitor_labels(partition, &so_path, Some(&key_str));
-                            monitor_record_histogram("so_fetch_duration_ms", fetch_dur, labels.clone());
-                            monitor_increment_counter("so_fetch_output_rows", out_rows as f64, labels.clone());
-                            monitor_increment_counter("so_fetch_output_bytes", out_bytes as f64, labels);
-                            monitor_update_processor(&monitor_id, "fetch", 0, out_rows, 0, out_bytes, fetch_dur);
-                            _total_output_rows += out_rows;
-                            _total_output_bytes += out_bytes;
-                        }
 
                         if let Some(batch) = output_batch {
                             tx.send(Ok(batch)).await.unwrap();
@@ -582,25 +440,12 @@ impl ExecutionPlan for MapPartitionExec {
 
                 // ---- Phase 6: _finish (serial for all processors, in key order) ----
                 for key in &key_order {
-                    #[cfg(feature = "monitoring")]
-                    let t_finish = std::time::Instant::now();
-
                     let processor = processors.get_mut(key).unwrap();
                     let rc = unsafe { finish_func(processor.so_ctx.ctx) };
                     if rc != 0 {
                         return Err(DataFusionError::Internal(format!(
                             "{finish_name} returned error code {rc} for key {key:?}"
                         )));
-                    }
-
-                    #[cfg(feature = "monitoring")]
-                    {
-                        let key_str = format!("{key:?}");
-                        let finish_dur = t_finish.elapsed().as_secs_f64() * 1000.0;
-                        let labels = monitor_labels(partition, &so_path, Some(&key_str));
-                        monitor_record_histogram("so_finish_duration_ms", finish_dur, labels.clone());
-                        monitor_finish_processor(&processors.get(key).unwrap().monitor_id, finish_dur);
-                        monitor_log("info", "finish", &format!("partition={partition} key={key_str} finished"), labels);
                     }
                 }
 
@@ -619,25 +464,11 @@ impl ExecutionPlan for MapPartitionExec {
                     })?
                 };
 
-                #[cfg(feature = "monitoring")]
-                let t_init = std::time::Instant::now();
-
                 let input_schema_bytes = encode_schema_to_ipc(input_stream.schema().as_ref())?;
                 let raw_ctx = unsafe {
                     init_func(input_schema_bytes.as_ptr(), input_schema_bytes.len() as i64)
                 };
                 let so_ctx = SoContext { ctx: raw_ctx };
-
-                #[cfg(feature = "monitoring")]
-                {
-                    let init_dur = t_init.elapsed().as_secs_f64() * 1000.0;
-                    let labels = monitor_labels(partition, &so_path, None);
-                    monitor_record_histogram("so_init_duration_ms", init_dur, labels.clone());
-                    monitor_log("info", "init", &format!("partition={partition} initialized"), labels);
-                }
-
-                #[cfg(feature = "monitoring")]
-                let monitor_id = monitor_add_processor(&job_id, &so_path, &fn_name, partition, None, t_init.elapsed().as_secs_f64() * 1000.0);
 
                 // ---- Phase 3: _feed (streaming input) ----
                 let feed_name = format!("{fn_name}_feed");
@@ -653,38 +484,15 @@ impl ExecutionPlan for MapPartitionExec {
                     let batch = batch?;
                     let input_bytes = encode_batch_to_ipc(&batch)?;
 
-                    #[cfg(feature = "monitoring")]
-                    let feed_rows = batch.num_rows() as u64;
-                    #[cfg(feature = "monitoring")]
-                    let feed_bytes_in = input_bytes.len() as u64;
-                    #[cfg(feature = "monitoring")]
-                    let t_feed = std::time::Instant::now();
-
                     drop(batch);
 
                     let rc = unsafe {
                         feed_func(so_ctx.ctx, input_bytes.as_ptr(), input_bytes.len() as i64)
                     };
                     if rc != 0 {
-                        #[cfg(feature = "monitoring")]
-                        {
-                            let labels = monitor_labels(partition, &so_path, None);
-                            monitor_increment_counter("so_error_count", 1.0, labels);
-                            monitor_log("error", "feed", &format!("partition={partition} error code {rc}"), monitor_labels(partition, &so_path, None));
-                        }
                         return Err(DataFusionError::Internal(format!(
                             "{feed_name} returned error code {rc}"
                         )));
-                    }
-
-                    #[cfg(feature = "monitoring")]
-                    {
-                        let feed_dur = t_feed.elapsed().as_secs_f64() * 1000.0;
-                        let labels = monitor_labels(partition, &so_path, None);
-                        monitor_record_histogram("so_feed_duration_ms", feed_dur, labels.clone());
-                        monitor_increment_counter("so_feed_input_rows", feed_rows as f64, labels.clone());
-                        monitor_increment_counter("so_feed_input_bytes", feed_bytes_in as f64, labels);
-                        monitor_update_processor(&monitor_id, "feed", feed_rows, 0, feed_bytes_in, 0, feed_dur);
                     }
                 }
 
@@ -697,28 +505,11 @@ impl ExecutionPlan for MapPartitionExec {
                         })?
                     };
 
-                #[cfg(feature = "monitoring")]
-                let t_exec = std::time::Instant::now();
-
                 let rc = unsafe { exec_func(so_ctx.ctx) };
                 if rc != 0 {
-                    #[cfg(feature = "monitoring")]
-                    {
-                        let labels = monitor_labels(partition, &so_path, None);
-                        monitor_increment_counter("so_error_count", 1.0, labels);
-                    }
                     return Err(DataFusionError::Internal(format!(
                         "{exec_name} returned error code {rc}"
                     )));
-                }
-
-                #[cfg(feature = "monitoring")]
-                {
-                    let exec_dur = t_exec.elapsed().as_secs_f64() * 1000.0;
-                    let labels = monitor_labels(partition, &so_path, None);
-                    monitor_record_histogram("so_execute_duration_ms", exec_dur, labels.clone());
-                    monitor_update_processor(&monitor_id, "execute", 0, 0, 0, 0, exec_dur);
-                    monitor_log("info", "execute", &format!("partition={partition} executed"), labels);
                 }
 
                 // ---- Phase 5: _fetch (streaming output) ----
@@ -732,9 +523,6 @@ impl ExecutionPlan for MapPartitionExec {
                 };
 
                 loop {
-                    #[cfg(feature = "monitoring")]
-                    let t_fetch = std::time::Instant::now();
-
                     let (output_batch, status) = {
                         let mut output_ptr: *mut u8 = std::ptr::null_mut();
                         let mut output_len: i64 = 0;
@@ -757,18 +545,6 @@ impl ExecutionPlan for MapPartitionExec {
                         }
                     };
 
-                    #[cfg(feature = "monitoring")]
-                    if let Some(ref batch) = output_batch {
-                        let out_rows = batch.num_rows() as u64;
-                        let out_bytes = batch.get_array_memory_size() as u64;
-                        let fetch_dur = t_fetch.elapsed().as_secs_f64() * 1000.0;
-                        let labels = monitor_labels(partition, &so_path, None);
-                        monitor_record_histogram("so_fetch_duration_ms", fetch_dur, labels.clone());
-                        monitor_increment_counter("so_fetch_output_rows", out_rows as f64, labels.clone());
-                        monitor_increment_counter("so_fetch_output_bytes", out_bytes as f64, labels);
-                        monitor_update_processor(&monitor_id, "fetch", 0, out_rows, 0, out_bytes, fetch_dur);
-                    }
-
                     if let Some(batch) = output_batch {
                         tx.send(Ok(batch)).await.unwrap();
                     } else {
@@ -789,9 +565,6 @@ impl ExecutionPlan for MapPartitionExec {
                         })?
                     };
 
-                #[cfg(feature = "monitoring")]
-                let t_finish = std::time::Instant::now();
-
                 let rc = unsafe { finish_func(so_ctx.ctx) };
                 if rc != 0 {
                     return Err(DataFusionError::Internal(format!(
@@ -799,23 +572,8 @@ impl ExecutionPlan for MapPartitionExec {
                     )));
                 }
 
-                #[cfg(feature = "monitoring")]
-                {
-                    let finish_dur = t_finish.elapsed().as_secs_f64() * 1000.0;
-                    let labels = monitor_labels(partition, &so_path, None);
-                    monitor_record_histogram("so_finish_duration_ms", finish_dur, labels.clone());
-                    monitor_finish_processor(&monitor_id, finish_dur);
-                    monitor_log("info", "finish", &format!("partition={partition} finished"), labels);
-                }
-
                 // processor 已 finish 并释放，通知 glibc 归还空闲内存页给 OS
                 unsafe { libc::malloc_trim(0) };
-            }
-
-            #[cfg(feature = "monitoring")]
-            {
-                let labels = monitor_labels(partition, &so_path, None);
-                monitor_record_histogram("so_partition_duration_ms", partition_start.elapsed().as_secs_f64() * 1000.0, labels);
             }
 
             Ok(())
