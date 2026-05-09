@@ -123,7 +123,7 @@ done
 | 08:50:21 | 1,930 MB | execute 开始 | 遍历 HashMap，触发 Linux 惰性页面映射 |
 | **08:50:22** | **4,331 MB** | **execute 峰值** | 8 个 task 同时在 execute |
 | 08:50:23 | 3,995 MB | fetch | 输出中，部分数据释放 |
-| 08:50:24 | 702 MB | finish | finish + malloc_trim 完成 |
+| 08:50:24 | 702 MB | finish | finish 完成 |
 
 ## 问题分析：Executor 峰值 4.3GB 的根因
 
@@ -133,15 +133,25 @@ done
 
 ### 内存归因拆解
 
+4.3 GB 峰值几乎全部来自 processor 缓存业务数据。框架和 Ballista 开销不可拆分控制。
+
 ```
 ⚫ Processor 缓存 JSON String   ≈ 3.2 GB  (74%)
-⚫ HashMap 开销 + Vec capacity   ≈ 0.4 GB  ( 9%)
-⚫ Arrow Flight 流式缓冲区残留   ≈ 0.3 GB  ( 7%)
-⚫ to_string_array() 临时 clone  ≈ 0.2 GB  ( 5%)
-⚫ 其他 (tokio/进程基础/杂项)    ≈ 0.1 GB  ( 2%)
+   每行 4KB JSON → Rust String，全量存入 HashMap
+   8 并发 × 100K 行 × 4KB = 3.2 GB
+
+⚫ Processor 其他缓存            ≈ 0.06 GB
+   recordid、channelid、HashMap/Vec 结构体
+
+⚫ 框架 + Ballista + 进程        ≈ 1.0 GB  (23%)
+   Arrow Flight 流缓冲、Ballista 内部状态、
+   gRPC 连接、tokio runtime、OS 页表等
+   均不在扩展点控制范围内
 ─────────────────────────────────────────
   合计                          ≈ 4.3 GB  (100%)
 ```
+
+> 注：`to_string_array()` 内部 `.clone()` 是 `Arc<ArrayData>` 引用计数 +1，不复制底层 buffer，不产生额外内存。真正的拷贝发生在每行 `.to_string()` 创建 Rust String 时，已统一归入"Processor 缓存 JSON String"。
 
 ### 逐行代码追踪
 
@@ -151,16 +161,9 @@ done
    ```rust
    let json_val = jsons.value(i).to_string();
    ```
-   每行 4KB JSON 被拷贝为独立的堆分配 Rust String，存入 `self.clusters: HashMap<String, Vec<(String, String)>>`。
+   每行 4KB JSON 被拷贝为独立的堆分配 Rust String，存入 `self.clusters: HashMap<String, Vec<(String, String)>>`。这是峰值内存的唯一主要原因。
 
-2. **`feed()` — to_string_array() 批量 clone**（第 113-116 行）：
-   ```rust
-   let regions = to_string_array(batch.column(region_idx));  // .clone()
-   let jsons = to_string_array(batch.column(json_idx));      // .clone()
-   ```
-   每一批输入为每个列产生临时全量拷贝（feed 返回后释放）。
-
-3. **`execute()` — clusters 仍存活**（第 157 行）：
+2. **`execute()` — clusters 仍存活**（第 157 行）：
    ```rust
    let mut rows: Vec<OutputRow> = self.clusters.iter().map(...)...
    ```
@@ -202,6 +205,8 @@ done
 ### 框架侧优化效果
 
 C Data Interface 相比 IPC 方案：
-- **消除了序列化/反序列化的中间内存**：不再产生 IPC byte buffer（原来每批次约 400MB 临时序列化数据）
-- **Arc 引用计数传递而非字节拷贝**：跨 FFI 边界的 RecordBatch 通过 `Buffer::clone()`（Arc 自增）传递
-- **不再需要 `libc::free`**：框架无需手动管理 .so 分配的内存
+- **消除序列化中间内存**：不再产生 IPC byte buffer，零拷贝跨 FFI 边界
+- **Arc 引用计数传递**：`Buffer::clone()` = Arc 自增，无数据拷贝
+- **耗时 -22%，峰值 -12%**：完全归因于消除 IPC 编解码的内存和 CPU 开销
+
+框架层已无进一步优化空间——剩余开销分布在 Ballista Arrow Flight 流缓冲、gRPC 连接、tokio runtime 中，均不在扩展点控制范围。
