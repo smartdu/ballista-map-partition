@@ -125,6 +125,26 @@ done
 | 08:50:23 | 3,995 MB | fetch | 输出中，部分数据释放 |
 | 08:50:24 | 702 MB | finish | finish 完成 |
 
+### 多轮连续运行稳定性验证
+
+Scheduler 和 Executor 不重启，连续执行 3 轮 bench（每轮 50 regions × 4KB JSON × 5M 行）。
+
+| 指标 | Round 1 (冷) | Round 2 | Round 3 |
+|------|------------|---------|---------|
+| 峰值 RSS | 4,980 MB | 4,178 MB | ~3,995 MB |
+| 轮间最低 RSS | 20 MB | 739 MB | 710 MB |
+| 计算耗时 | 23.43s | 12.52s | 12.81s |
+| 吞吐量 | 213K rec/s | 399K rec/s | 390K rec/s |
+| 输出正确性 | ✓ | ✓ | ✓ |
+
+关键结论：
+
+- **峰值递减，没有泄漏**：如果存在内存泄漏，峰值应递增。实际峰值从 4.9 GB 降至 ~4.0 GB
+- **轮间回到同一基线**：finish 后 RSS 稳定回落到 ~710 MB，每轮释放量一致
+- **Round 1 偏高**：冷启动效应（MinIO 无 page cache、Ballista 缓冲区首次分配、glibc arena cold start），非泄漏
+- **Round 2/3 稳定**：耗时和吞吐量基本一致，框架层内存稳态 ~1.0 GB（与单轮测试一致）
+- **长时运行安全**：Scheduler + Executor 不重启，3 轮累积处理 1,500 万行数据，RSS 不涨
+
 ## 问题分析：Executor 峰值 4.3GB 的根因
 
 ### 结论
