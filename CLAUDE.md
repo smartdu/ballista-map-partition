@@ -7,7 +7,7 @@ A Ballista extension providing `map_partition` operator backed by `.so` dynamic 
 ## Docs
 
 - [README.md](./README.md) — 项目总览、快速开始、API 文档
-- [design.md](./design.md) — 架构设计：S3 集成、DistributeBy、C Data Interface、SDK 架构
+- [DESIGN.md](./DESIGN.md) — 架构设计：S3 集成、DistributeBy、C Data Interface、SDK 架构
 - [PERF.md](./PERF.md) — 性能压测流程、结果对比、内存分析
 
 ## Project Structure
