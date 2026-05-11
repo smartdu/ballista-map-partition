@@ -16,7 +16,7 @@ set -euo pipefail
 # ============================================================
 
 E=1             # executor 数量
-N=8             # 每 executor 并发数
+C=8             # 每 executor 并发数
 REGIONS=50
 JSON=4096
 
@@ -31,7 +31,7 @@ while getopts "e:n:r:j:h" opt; do
     esac
 done
 
-[[ "$N" -ge 1 ]] || usage
+[[ "$C" -ge 1 ]] || usage
 [[ "$E" -eq 1 ]] && MINIO_NODES=1 || MINIO_NODES=4
 
 TOTAL_ROWS=$((REGIONS * 100 * 1000))
@@ -125,11 +125,11 @@ start_cluster() {
     SCHED_PID=$(ss -tlnp | grep ":50050 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
     ok "  Scheduler PID=$SCHED_PID"
 
-    ok "=== 启动 $E 个 Executor (各 $N 并发) ==="
+    ok "=== 启动 $E 个 Executor (各 $C 并发) ==="
     for i in $(seq 1 $E); do
         local flight=$((50050 + i * 2 - 1))
         local grpc=$((50050 + i * 2))
-        "$EXEC" -p $flight --bind-grpc-port $grpc -c $N > "$OUTDIR/executor_${i}.log" 2>&1 &
+        "$EXEC" -p $flight --bind-grpc-port $grpc -c $C > "$OUTDIR/executor_${i}.log" 2>&1 &
     done
     sleep $((4 + E * 2))
 
@@ -231,7 +231,7 @@ cat <<EOF | tee "$OUTDIR/result.txt"
 
   配置:
     Executor 数:   $E
-    每 Exec 并发:  $N
+    每 Exec 并发:  $C
     Region 数:     $REGIONS × 100 channel × 1000 轨迹 = ${TOTAL_ROWS} 行
     JSON 大小:     $JSON 字节
 
