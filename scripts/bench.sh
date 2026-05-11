@@ -134,19 +134,21 @@ start_cluster() {
     ok "=== ${E} Executor (各 ${C} 并发) ==="
     EXEC_PIDS=()
     for i in $(seq 1 $E); do
-        local flight=$((50050 + i * 2 - 1))
-        local grpc=$((50050 + i * 2))
+        flight=$((50050 + i * 2 - 1))
+        grpc=$((50050 + i * 2))
         "$EXEC" -p $flight --bind-grpc-port $grpc -c $C > "$OUTDIR/executor_${i}.log" 2>&1 &
-        EXEC_PIDS+=($!)
+        pid=$!
+        EXEC_PIDS+=($pid)
+        ok "  启动 Executor #$i, PID=$pid, port=$flight"
     done
-    sleep $((2 + E))
+    sleep 5
 
     for i in $(seq 0 $((${#EXEC_PIDS[@]} - 1))); do
-        local pid=${EXEC_PIDS[$i]}
+        pid=${EXEC_PIDS[$i]}
         if kill -0 $pid 2>/dev/null; then
-            ok "  Executor #$((i+1)) PID=$pid ✓"
+            ok "  Executor #$((i+1)) PID=$pid ✓ 存活"
         else
-            fail "Executor #$((i+1)) PID=$pid 启动失败:"
+            fail "Executor #$((i+1)) PID=$pid 已退出, 日志:"
             cat "$OUTDIR/executor_$((i+1)).log"
             exit 1
         fi
