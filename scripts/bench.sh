@@ -129,8 +129,8 @@ start_cluster
 MON_CSV="$OUTDIR/monitor.csv"
 exec_pids=""
 for i in $(seq 1 $E); do
-    local flight=$((50050 + i * 2 - 1))
-    local pid=$(ss -tlnp | grep ":$flight " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+    flight=$((50050 + i * 2 - 1))
+    pid=$(ss -tlnp | grep ":$flight " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
     exec_pids="$exec_pids $pid"
 done
 sched_pid=$(ss -tlnp | grep ":50050 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
