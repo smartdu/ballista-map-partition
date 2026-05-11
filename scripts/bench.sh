@@ -48,15 +48,29 @@ done
 # ============================================================
 clean() {
     ok "=== 清理 ==="
+
+    # 按进程名杀
     ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+
+    # 按端口杀 (兜底: 可能有其他进程占用了我们的端口)
+    for port in 50050 50051 50052 50053 50054 50055 50056 50057 50058 9000; do
+        local pid=$(ss -tlnp 2>/dev/null | grep ":$port " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+        [[ -n "$pid" ]] && { kill -9 "$pid" 2>/dev/null || true; }
+    done
     sleep 2
+
     docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker stop  2>/dev/null || true
     docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker rm    2>/dev/null || true
-    docker volume rm -f bench-minio-{1,2,3,4} 2>/dev/null || true
+    docker volume ls -q --filter "name=bench-minio" 2>/dev/null | xargs -r docker volume rm -f 2>/dev/null || true
     docker network rm bench-net 2>/dev/null || true
     sleep 2
-    local n=$(ps aux | grep distributed_compute | grep -v grep | wc -l)
-    [[ "$n" -eq 0 ]] || { fail "残留 $n 个进程"; exit 1; }
+
+    # 最终校验
+    local n=0
+    for port in 50050 50051 50053 50055 50057 9000; do
+        ss -tlnp 2>/dev/null | awk -v p="$port" '$4 ~ ":"p"$"' | grep -q . && n=$((n + 1))
+    done
+    [[ "$n" -eq 0 ]] || { fail "残留 $n 个端口占用"; exit 1; }
     ok "干净"
 }
 
@@ -64,8 +78,11 @@ start_minio() {
     ok "=== MinIO (${E} 节点) ==="
     docker network create bench-net 2>/dev/null || true
 
+    # 先删同名容器 (兜底)
+    for i in $(seq 1 $E); do docker rm -f minio${i} 2>/dev/null || true; done
+
     # Docker volumes (overlayfs bind mount 不支持 O_DIRECT)
-    docker volume rm -f bench-minio-{1,2,3,4} 2>/dev/null || true
+    docker volume ls -q --filter "name=bench-minio" 2>/dev/null | xargs -r docker volume rm -f 2>/dev/null || true
     for i in $(seq 1 $E); do docker volume create bench-minio-${i} > /dev/null; done
 
     if [[ $E -eq 1 ]]; then
@@ -109,23 +126,31 @@ if not c.bucket_exists('ballista'): c.make_bucket('ballista')
 start_cluster() {
     ok "=== Scheduler ==="
     "$SCHED" > "$OUTDIR/scheduler.log" 2>&1 &
-    sleep 2
-    ss -tlnp | grep -q ":50050 " || { fail "Scheduler 未启动"; exit 1; }
-    ok "  Scheduler 就绪"
+    SCHED_PID=$!
+    sleep 3
+    kill -0 $SCHED_PID 2>/dev/null || { fail "Scheduler 未启动"; cat "$OUTDIR/scheduler.log"; exit 1; }
+    ok "  Scheduler PID=$SCHED_PID"
 
     ok "=== ${E} Executor (各 ${C} 并发) ==="
+    EXEC_PIDS=()
     for i in $(seq 1 $E); do
         local flight=$((50050 + i * 2 - 1))
         local grpc=$((50050 + i * 2))
         "$EXEC" -p $flight --bind-grpc-port $grpc -c $C > "$OUTDIR/executor_${i}.log" 2>&1 &
+        EXEC_PIDS+=($!)
     done
-    sleep $((4 + E * 2))
+    sleep $((2 + E))
 
-    for i in $(seq 1 $E); do
-        local flight=$((50050 + i * 2 - 1))
-        ss -tlnp | grep -q ":$flight " || { fail "Executor #$i 未启动"; exit 1; }
+    for i in $(seq 0 $((${#EXEC_PIDS[@]} - 1))); do
+        local pid=${EXEC_PIDS[$i]}
+        if kill -0 $pid 2>/dev/null; then
+            ok "  Executor #$((i+1)) PID=$pid ✓"
+        else
+            fail "Executor #$((i+1)) PID=$pid 启动失败:"
+            cat "$OUTDIR/executor_$((i+1)).log"
+            exit 1
+        fi
     done
-    ok "  ${E} Executor 就绪"
 }
 
 # ============================================================
@@ -137,31 +162,39 @@ start_cluster
 # 监控
 # ============================================================
 MON_CSV="$OUTDIR/monitor.csv"
-exec_pids=""
-for i in $(seq 1 $E); do
-    flight=$((50050 + i * 2 - 1))
-    pid=$(ss -tlnp | grep ":$flight " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
-    exec_pids="$exec_pids $pid"
-done
-sched_pid=$(ss -tlnp | grep ":50050 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
-minio_pid=$(docker inspect minio1 2>/dev/null | sed -n 's/.*"Pid": *\([0-9]*\).*/\1/p' | head -1)
 
-echo "#ts $(echo $exec_pids | sed 's/ /_rss /g')_rss sched_rss minio_rss" > "$MON_CSV"
+# 收集所有要监控的 PID
+ALL_PIDS=("${EXEC_PIDS[@]}")
+ALL_PIDS+=($SCHED_PID)
+for c in $(seq 1 $E); do
+    pid=$(docker inspect minio${c} 2>/dev/null | sed -n 's/.*"Pid": *\([0-9]*\).*/\1/p' | head -1)
+    [[ -n "$pid" ]] && ALL_PIDS+=($pid)
+done
+ALL_NAMES=()
+for i in $(seq 1 $E); do ALL_NAMES+=("executor${i}"); done
+ALL_NAMES+=("scheduler")
+for i in $(seq 1 $E); do ALL_NAMES+=("minio${i}"); done
+
+# 表头
+(   echo -n "#ts"
+    for n in "${ALL_NAMES[@]}"; do echo -n " ${n}_rss"; done
+    echo
+) > "$MON_CSV"
+
+# 采集
 (   while true; do
-        TS=$(date +%H:%M:%S); out="$TS"
-        for pid in $exec_pids; do
+        out="$(date +%H:%M:%S)"
+        for pid in "${ALL_PIDS[@]}"; do
             out="$out $(awk '/VmRSS/ {printf "%d",$2/1024}' /proc/$pid/status 2>/dev/null || echo 0)"
         done
-        out="$out $(awk '/VmRSS/ {printf "%d",$2/1024}' /proc/$sched_pid/status 2>/dev/null || echo 0)"
-        out="$out $(awk '/VmRSS/ {printf "%d",$2/1024}' /proc/$minio_pid/status 2>/dev/null || echo 0)"
         echo "$out"; sleep 1
     done
-) > "$MON_CSV" &
+) >> "$MON_CSV" &
 MON_PID=$!
 sleep 1
 
-BASELINE=$(tail -1 "$MON_CSV" | awk '{for(i=2;i<=NF;i++) printf "%d ", $i}')
-ok "  冷启动 RSS: $(echo $BASELINE)"
+BASELINE=$(tail -1 "$MON_CSV")
+ok "  冷启动: $BASELINE"
 ok "=== 压测 ==="
 ok "  配置: ${E}e × ${C}c  |  ${REGIONS}r × ${JSON}B  |  ${TOTAL_ROWS} 行"
 
@@ -180,39 +213,32 @@ TPUT=$(grep  "吞吐量"           "$OUTDIR/bench.log" | awk -F': ' '{print $2}'
 ROWS=$(grep  "输出行数"         "$OUTDIR/bench.log" | head -1 | awk -F': ' '{print $2}')
 CROSS=$(grep -c "无 CROSS_REGION_ERROR" "$OUTDIR/bench.log" || true)
 
-# Executor: 所有 executor 列的最大值/平均值
-PEAK_EXEC=""
-for i in $(seq 1 $E); do
-    p=$(awk "NR>1 {if(\$((i+1))+0>m) m=\$((i+1))} END{printf \"%d\", m}" "$MON_CSV")
-    PEAK_EXEC="$PEAK_EXEC $p"
+# 逐个进程统计
+result_lines=""
+for idx in $(seq 0 $((${#ALL_PIDS[@]} - 1))); do
+    name="${ALL_NAMES[$idx]}"
+    col=$((idx + 2))  # CSV 第 1 列是 ts
+    base=$(awk "NR==2 {printf \"%d\", \$$col}" "$MON_CSV")
+    peak=$(awk "NR>1  {if(\$$col+0>m) m=\$$col} END{printf \"%d\", m}" "$MON_CSV")
+    after=$(tail -20 "$MON_CSV" | awk "{s+=\$$col} END{printf \"%d\", s/(NR-1)}")
+    result_lines="$result_lines${name} ${base} ${peak} ${after}\n"
 done
-PEAK_EXEC=$(echo $PEAK_EXEC | xargs)
-PEAK_SCHED=$(awk "NR>1 {if(\$(NF-1)+0>m) m=\$(NF-1)} END{printf \"%d\", m}" "$MON_CSV")
-PEAK_MINIO=$(awk "NR>1 {if(\$NF+0>m) m=\$NF} END{printf \"%d\", m}" "$MON_CSV")
-BASE_EXEC=$(head -2 "$MON_CSV" | tail -1 | awk '{printf "%d", $2}')
-BASE_SCHED=$(head -2 "$MON_CSV" | tail -1 | awk '{printf "%d", $(NF-1)}')
-BASE_MINIO=$(head -2 "$MON_CSV" | tail -1 | awk '{printf "%d", $NF}')
-AFT_EXEC=$(tail -20 "$MON_CSV" | awk "NR>1 {s+=\$2} END{printf \"%d\", s/(NR-1)}")
-AFT_SCHED=$(tail -20 "$MON_CSV" | awk 'NR>1 {s+=$(NF-1)} END{printf "%d", s/(NR-1)}')
-AFT_MINIO=$(tail -20 "$MON_CSV" | awk 'NR>1 {s+=$NF} END{printf "%d", s/(NR-1)}')
+result_lines=$(echo -e "$result_lines")
 
 cat <<EOF | tee "$OUTDIR/result.txt"
 
   配置:       ${E} Executor × ${C} 并发  |  ${REGIONS} regions × ${JSON}B JSON  |  ${TOTAL_ROWS} 行
+  耗时:       数据生成+写入 ${GEN_T}s  |  分布式计算 ${CMP_T}s  |  吞吐量 $TPUT
 
-  耗时:       数据生成+写入  ${GEN_T}s  |  分布式计算  ${CMP_T}s  |  吞吐量  $TPUT
-
-  内存 (MB):  ┌─────────┬────────┬────────┬────────┐
-              │         │ 冷启动 │ 峰值   │ 回落   │
-              ├─────────┼────────┼────────┼────────┤
-              │ Executor│ $(printf '%6s' $BASE_EXEC) │ $(printf '%6s' "$PEAK_EXEC") │ $(printf '%6s' $AFT_EXEC) │
-              │ Scheduler│ $(printf '%5s' $BASE_SCHED) │ $(printf '%6s' $PEAK_SCHED) │ $(printf '%6s' $AFT_SCHED) │
-              │ MinIO   │ $(printf '%6s' $BASE_MINIO) │ $(printf '%6s' $PEAK_MINIO) │ $(printf '%6s' $AFT_MINIO) │
-              └─────────┴────────┴────────┴────────┘
+  内存 (MB):
+              NAME        冷启动   峰值     回落
+$(echo "$result_lines" | while read name base peak after; do
+    printf "              %-10s %6s %8s %8s\n" "$name" "$base" "$peak" "$after"
+done)
 
   正确性:     $([[ $CROSS -ge 1 ]] && echo "✅ 无 CROSS_REGION_ERROR" || echo "❌ 异常")
 
-  数据目录:   $OUTDIR
+  原始数据:   $OUTDIR/monitor.csv
 EOF
 
 [[ "$RC" -eq 0 ]] || exit 1
