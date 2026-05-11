@@ -52,8 +52,8 @@ clean() {
     sleep 2
     docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker stop  2>/dev/null || true
     docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker rm    2>/dev/null || true
+    docker volume rm -f bench-minio-{1,2,3,4} 2>/dev/null || true
     docker network rm bench-net 2>/dev/null || true
-    rm -rf /tmp/bench-data
     sleep 2
     local n=$(ps aux | grep distributed_compute | grep -v grep | wc -l)
     [[ "$n" -eq 0 ]] || { fail "残留 $n 个进程"; exit 1; }
@@ -63,11 +63,14 @@ clean() {
 start_minio() {
     ok "=== MinIO (${E} 节点) ==="
     docker network create bench-net 2>/dev/null || true
-    mkdir -p /tmp/bench-data/minio{1,2,3,4}
+
+    # Docker volumes (overlayfs bind mount 不支持 O_DIRECT)
+    docker volume rm -f bench-minio-{1,2,3,4} 2>/dev/null || true
+    for i in $(seq 1 $E); do docker volume create bench-minio-${i} > /dev/null; done
 
     if [[ $E -eq 1 ]]; then
         docker run -d --name minio1 --network bench-net \
-            -p 9000:9000 -v /tmp/bench-data/minio1:/data \
+            -p 9000:9000 -v bench-minio-1:/data \
             -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
             quay.io/minio/minio server /data --address ":9000" > /dev/null
         sleep 5
@@ -75,15 +78,13 @@ start_minio() {
         local nodes=""
         for i in $(seq 1 $E); do nodes="$nodes http://minio${i}/data"; done
         docker run -d --name minio1 --network bench-net --hostname minio1 \
-            -p 9000:9000 -v /tmp/bench-data/minio1:/data \
+            -p 9000:9000 -v bench-minio-1:/data \
             -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-            -e MINIO_DISABLE_DIRECT_IO=1 \
             quay.io/minio/minio server $nodes --address ":9000" 2>&1 | tee -a "$OUTDIR/minio.log"
         for i in $(seq 2 $E); do
             docker run -d --name minio${i} --network bench-net --hostname minio${i} \
-                -v /tmp/bench-data/minio${i}:/data \
+                -v bench-minio-${i}:/data \
                 -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-                -e MINIO_DISABLE_DIRECT_IO=1 \
                 quay.io/minio/minio server $nodes --address ":9000" 2>&1 | tee -a "$OUTDIR/minio.log"
         done
         sleep 8
