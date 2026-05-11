@@ -24,7 +24,7 @@ usage() { echo "用法: $0 [-e 1|2] [-n concurrent] [-r regions] [-j json_bytes]
 while getopts "e:n:r:j:h" opt; do
     case $opt in
         e) E="$OPTARG"; [[ "$E" =~ ^[12]$ ]] || usage ;;
-        n) N="$OPTARG" ;;
+        n) C="$OPTARG" ;;
         r) REGIONS="$OPTARG" ;;
         j) JSON="$OPTARG" ;;
         *) usage ;;
