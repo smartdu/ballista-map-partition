@@ -77,11 +77,13 @@ start_minio() {
         docker run -d --name minio1 --network bench-net --hostname minio1 \
             -p 9000:9000 -v /tmp/bench-data/minio1:/data \
             -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
+            -e MINIO_DISABLE_DIRECT_IO=1 \
             quay.io/minio/minio server $nodes --address ":9000" 2>&1 | tee -a "$OUTDIR/minio.log"
         for i in $(seq 2 $E); do
             docker run -d --name minio${i} --network bench-net --hostname minio${i} \
                 -v /tmp/bench-data/minio${i}:/data \
                 -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
+                -e MINIO_DISABLE_DIRECT_IO=1 \
                 quay.io/minio/minio server $nodes --address ":9000" 2>&1 | tee -a "$OUTDIR/minio.log"
         done
         sleep 8
