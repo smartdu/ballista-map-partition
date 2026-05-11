@@ -103,6 +103,98 @@ done
 
 **输出验证**：5,000 个档案（= 50 regions × 100 channels），无 `CROSS_REGION_ERROR`，DistributeBy 分区语义正确。
 
+### 多 Executor 扩展性
+
+MinIO 4 节点分布式集群，总并发固定为 8。
+
+| 配置 | 每台并发 | 总并发 | 计算耗时 | 吞吐量 |
+|------|---------|--------|---------|--------|
+| 1 Executor × 8 | 8 | 8 | **6.77s** | **738,566 rec/s** |
+| 4 Executor × 2 | 2 | 8 | 7.60s | 657,668 rec/s |
+
+4 Executor 略慢于 1 Executor（+12% 耗时），原因：4 台 Executor 在同一台机器上竞争 CPU 和内存，且 Ballista RepartitionExec 的跨 Executor shuffle 引入额外 gRPC 数据传输开销，在单机环境下没有真正的 I/O 分散收益。
+
+**结论**：单机部署场景 1 Executor 足矣。多 Executor 的优势在真正的多机集群（每台机有独立 CPU/内存/磁盘）中才能体现。
+
+### 测试操作步骤
+
+**环境：MinIO 4 节点分布式集群**
+
+```bash
+# 1. 创建 Docker 网络
+docker network create minio-net
+
+# 2. 删除旧容器
+docker stop minio{1,2,3,4} 2>/dev/null; docker rm minio{1,2,3,4} 2>/dev/null
+
+# 3. 启动 4 节点 MinIO 集群
+docker run -d --name minio1 --network minio-net --hostname minio1 \
+    -p 9000:9000 -p 9001:9001 -v /tmp/minio-cluster/data1:/data \
+    -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
+    quay.io/minio/minio server http://minio{1...4}/data \
+    --address ":9000" --console-address ":9001"
+
+for i in 2 3 4; do
+  docker run -d --name minio${i} --network minio-net --hostname minio${i} \
+      -v /tmp/minio-cluster/data${i}:/data \
+      -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
+      quay.io/minio/minio server http://minio{1...4}/data --address ":9000"
+done
+
+# 4. 创建 bucket
+python3 -c "
+from minio import Minio
+client = Minio('localhost:9000', access_key='MINIO', secret_key='MINIOSECRET', secure=False)
+if not client.bucket_exists('ballista'): client.make_bucket('ballista')
+"
+```
+
+**测试 1：1 Executor × 8 并发**
+
+```bash
+ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' | xargs -r kill
+sleep 2
+
+./target/release/examples/distributed_compute_scheduler &
+sleep 2
+
+./target/release/examples/distributed_compute_executor \
+    -p 50051 --bind-grpc-port 50052 -c 8 &
+sleep 5
+
+# 校验
+ss -tlnp | grep -E ":50050|:50051" || echo "Missing ports"
+
+MAP_PARTITION_SO=./target/release/libregion_cluster_processor.so \
+  ./target/release/examples/bench_region_cluster_client -r 50 -j 4096
+```
+
+**测试 2：4 Executor × 2 并发**
+
+```bash
+ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' | xargs -r kill
+sleep 2
+
+./target/release/examples/distributed_compute_scheduler &
+sleep 2
+
+for i in 1 2 3 4; do
+    flight=$((50050 + i * 2 - 1))
+    grpc=$((50050 + i * 2))
+    ./target/release/examples/distributed_compute_executor \
+        -p $flight --bind-grpc-port $grpc -c 2 &
+done
+sleep 5
+
+# 逐台校验
+for port in 50051 50053 50055 50057; do
+    ss -tlnp | grep -q ":$port " && echo "port $port ✓" || echo "port $port ✗"
+done
+
+MAP_PARTITION_SO=./target/release/libregion_cluster_processor.so \
+  ./target/release/examples/bench_region_cluster_client -r 50 -j 4096
+```
+
 ### 资源使用对比
 
 | 进程 | 空闲内存 | 峰值内存 | 峰值后内存 |
