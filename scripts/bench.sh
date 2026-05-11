@@ -77,16 +77,23 @@ start_minio() {
         docker run -d --name minio1 --network bench-net --hostname minio1 \
             -p 9000:9000 -v /tmp/bench-data/minio1:/data \
             -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-            quay.io/minio/minio server $nodes --address ":9000" > /dev/null
+            quay.io/minio/minio server $nodes --address ":9000" 2>&1 | tee -a "$OUTDIR/minio.log"
         for i in $(seq 2 $E); do
             docker run -d --name minio${i} --network bench-net --hostname minio${i} \
                 -v /tmp/bench-data/minio${i}:/data \
                 -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-                quay.io/minio/minio server $nodes --address ":9000" > /dev/null
+                quay.io/minio/minio server $nodes --address ":9000" 2>&1 | tee -a "$OUTDIR/minio.log"
         done
         sleep 8
         local up=$(docker ps --filter "name=minio" --format "{{.Names}}" | wc -l)
-        [[ "$up" -eq "$E" ]] || { fail "MinIO: 预期 $E 实际 $up"; exit 1; }
+        if [[ "$up" -ne "$E" ]]; then
+            fail "MinIO: 预期 $E 实际 $up"
+            fail "--- 容器状态 ---"
+            docker ps -a --filter "name=minio" --format "{{.Names}} {{.Status}}" | tee -a "$OUTDIR/minio.log"
+            fail "--- minio1 日志 ---"
+            docker logs minio1 2>&1 | tail -20 | tee -a "$OUTDIR/minio.log"
+            exit 1
+        fi
     fi
 
     python3 -c "
