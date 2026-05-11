@@ -33,6 +33,24 @@ pub fn encode_schema_to_ipc(schema: &Schema) -> Result<Vec<u8>, DataFusionError>
     Ok(buf)
 }
 
+/// Deep-copy a RecordBatch so its buffers are owned by the framework's allocator,
+/// not by the .so. This breaks the dependency on the .so's FFI_ArrowArray release
+/// callback, which would otherwise crash if the .so is unloaded before the batch
+/// is dropped by the downstream operator.
+fn deep_copy_batch(batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
+    use datafusion::arrow::array::StringArray;
+    use datafusion::arrow::array::ArrayRef;
+    let schema = batch.schema();
+    let cols: Vec<ArrayRef> = batch.columns().iter().map(|c| {
+        let arr = c.as_any().downcast_ref::<StringArray>().expect("output columns must be Utf8");
+        let vals: StringArray = (0..arr.len()).map(|i| {
+            if arr.is_null(i) { None } else { Some(arr.value(i)) }
+        }).collect();
+        Arc::new(vals) as ArrayRef
+    }).collect();
+    Ok(RecordBatch::try_new(schema, cols).map_err(|e| DataFusionError::Internal(format!("deep copy: {e}")))?)
+}
+
 /// Wrapper to make raw pointers Send-safe within our spawned task.
 /// Safety: we ensure these pointers are only accessed from the single spawned task.
 struct SoContext {
@@ -403,7 +421,7 @@ impl ExecutionPlan for MapPartitionExec {
                                     from_ffi_and_data_type(ffi_array, output_data_type.clone())
                                 }.map_err(|e| DataFusionError::Internal(format!("from_ffi_and_data_type: {e}")))?;
                                 let struct_array = StructArray::from(array_data);
-                                Some(RecordBatch::from(struct_array))
+                                Some(deep_copy_batch(&RecordBatch::from(struct_array))?)
                             }
                         };
 
@@ -520,7 +538,7 @@ impl ExecutionPlan for MapPartitionExec {
                                 from_ffi_and_data_type(ffi_array, output_data_type.clone())
                             }.map_err(|e| DataFusionError::Internal(format!("from_ffi_and_data_type: {e}")))?;
                             let struct_array = StructArray::from(array_data);
-                            Some(RecordBatch::from(struct_array))
+                            Some(deep_copy_batch(&RecordBatch::from(struct_array))?)
                         }
                     };
 

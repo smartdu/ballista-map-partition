@@ -96,10 +96,10 @@ pub unsafe fn export_batch_to_ffi(
     let data = struct_array.into_data();
     let (ffi_array, _ffi_schema) =
         to_ffi(&data).map_err(|e| format!("to_ffi: {e}"))?;
-    // Write into the caller's pre-allocated slot.
-    // Safety: caller guarantees `array_ptr` is valid for writes and is a
-    // pre-allocated FFI_ArrowArray::empty() slot. We write the exported data
-    // and forget the local to transfer ownership to the framework.
-    unsafe { std::ptr::write(array_ptr, ffi_array) };
+    // Transfer ownership to framework's pre-allocated slot.
+    // ManuallyDrop::into_inner extracts the FFI_ArrowArray WITHOUT running
+    // its Drop, preventing double-free. The framework now owns the data.
+    let ffi_array = std::mem::ManuallyDrop::new(ffi_array);
+    unsafe { std::ptr::write(array_ptr, std::mem::ManuallyDrop::into_inner(ffi_array)) };
     Ok(())
 }

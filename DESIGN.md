@@ -315,7 +315,13 @@ plan.transform_up(&|node| {
 
 ### 跨版本 Arrow 兼容
 
-.so (arrow 54) 和框架 (arrow 57) 之间通过 C Data Interface 互操作。`FFI_ArrowArray` 是 `#[repr(C)]` 结构体，两个版本字段布局完全相同。Release 回调是函数指针——消费者只调用生产者设置的指针，与版本无关。
+.so (arrow 54) 和框架 (arrow 57) 之间通过 C Data Interface 互操作。`FFI_ArrowArray` 是 `#[repr(C)]` 结构体，两个版本字段布局完全相同。Release 回调是函数指针——消费者只调用生产者设置的指针。
+
+**⚠ _fetch 方向的生命周期陷阱（核心教训）**：`_fetch` 返回的 `FFI_ArrowArray` 由 .so 的 `to_ffi` 创建，release 回调指向 .so 内的 `release_array` 函数。MapPartitionExec 的 async block 结束后 `lib` 被 drop → dlclose 卸载 .so。但输出 RecordBatch 还会流向下游算子（ShuffleWriter），在后续 drop 时才调用 release 回调——此时 .so 已卸载，函数指针悬空 → **SEGFAULT**。
+
+**修复**：fetch 路径导入 RecordBatch 后立即 `deep_copy_batch()`，将数据拷入框架侧 allocator 管理的 Buffer，断开对 .so release 回调的依赖。输出数据量通常远小于输入，拷贝代价可接受。
+
+**教训**：C Data Interface 的 release 回调是**生产者**设置的。_feed 方向生产者是框架（安全），_fetch 方向生产者是 .so（不安全）。凡是 .so 作为生产者的 FFI_ArrowArray，必须在 .so 卸载前完成数据拷贝。
 
 ### 效果
 
