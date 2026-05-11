@@ -10,7 +10,7 @@
 | Rust | 1.93.0 |
 | Docker | 27.5.1 |
 | 框架 | Ballista 52 + DataFusion 52 — Arrow C Data Interface |
-| .so 处理器 | `libregion_cluster_processor.so` (arrow 54) |
+| .so 处理器 | `libregion_cluster_processor.so` / `libnoop_processor.so` (arrow 54) |
 | 部署 | 单机，所有进程共宿 |
 
 ## 数据集
@@ -31,12 +31,25 @@
 ```bash
 # 编译
 cargo build --release -p region_cluster_processor
+cargo build --release -p noop_processor
 cargo build --release --examples
 
 # 测试
 ./scripts/bench.sh -e 1 -c 8   # 1 Executor × 8 并发 + 1 MinIO
 ./scripts/bench.sh -e 2 -c 4   # 2 Executor × 4 并发 + 2 MinIO 集群
+
+# 使用 noop 处理器测量框架开销
+MAP_PARTITION_SO=target/release/libnoop_processor.so \
+MAP_PARTITION_FN=noop_processor \
+  ./scripts/bench.sh -e 1 -c 8 -r 50 -j 4096
 ```
+
+环境变量覆盖（可选）：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MAP_PARTITION_SO` | `target/release/libregion_cluster_processor.so` | `.so` 路径 |
+| `MAP_PARTITION_FN` | `region_cluster_processor` | 函数名前缀 |
 
 脚本自动清理环境、部署 MinIO、启动 Scheduler/Executor、校验、运行时 RSS 监控、结果汇总。
 
@@ -92,6 +105,18 @@ cargo build --release --examples
 > `to_string_array().clone()` 是 `Arc<ArrayData>` 引用计数 +1，不产生新内存。拷贝发生在 `.to_string()` 创建 Rust String 时。
 
 RSS 时间线：**冷启动 20 MB → feed 200~740 MB → execute 峰值 5,167 MB → finish 回落 879 MB**。execute 阶段 RSS 跳升是因为 Linux 惰性缺页——`feed` 时 `malloc` 只分配虚拟地址，`execute` 遍历 HashMap 才触发物理页映射。
+
+## noop_processor 基准
+
+`noop_processor` 丢弃所有输入、不产生输出，可测量框架本身的 I/O + FFI 开销：
+
+```bash
+MAP_PARTITION_SO=target/release/libnoop_processor.so \
+MAP_PARTITION_FN=noop_processor \
+  ./scripts/bench.sh -e 1 -c 8 -r 50 -j 4096
+```
+
+业务处理器耗时减去 noop 框架耗时，即为纯业务计算时间。
 
 ### 降低峰值
 

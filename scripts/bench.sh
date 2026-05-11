@@ -12,6 +12,10 @@ set -euo pipefail
 #   -c  每 Executor 并发数 (默认 8)
 #   -r  Region 数 (默认 50)
 #   -j  JSON 大小 (默认 4096)
+#
+# 环境变量:
+#   MAP_PARTITION_SO   .so 路径 (默认 target/release/libregion_cluster_processor.so)
+#   MAP_PARTITION_FN   函数名前缀 (默认 region_cluster_processor)
 # ============================================================
 
 E=1 C=8 REGIONS=50 JSON=4096
@@ -35,7 +39,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BENCH="$ROOT/target/release/examples/bench_region_cluster_client"
 SCHED="$ROOT/target/release/examples/distributed_compute_scheduler"
 EXEC="$ROOT/target/release/examples/distributed_compute_executor"
-SO="$ROOT/target/release/libregion_cluster_processor.so"
+SO="${MAP_PARTITION_SO:-$ROOT/target/release/libregion_cluster_processor.so}"
+FN="${MAP_PARTITION_FN:-region_cluster_processor}"
 
 R='\033[0;31m'; G='\033[0;32m'; X='\033[0m'
 ok()   { echo -e "${G}[$(date +%H:%M:%S)]${X} $*" | tee -a "$OUTDIR/script.log"; }
@@ -201,7 +206,7 @@ ok "  冷启动: $BASELINE"
 ok "=== 压测 ==="
 ok "  配置: ${E}e × ${C}c  |  ${REGIONS}r × ${JSON}B  |  ${TOTAL_ROWS} 行"
 
-MAP_PARTITION_SO="$SO" "$BENCH" -r "$REGIONS" -j "$JSON" 2>&1 | tee "$OUTDIR/bench.log"
+MAP_PARTITION_SO="$SO" MAP_PARTITION_FN="$FN" "$BENCH" -r "$REGIONS" -j "$JSON" 2>&1 | tee "$OUTDIR/bench.log"
 RC=${PIPESTATUS[0]}
 
 kill $MON_PID 2>/dev/null || true; wait $MON_PID 2>/dev/null || true
