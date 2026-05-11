@@ -52,25 +52,26 @@ clean() {
     # 按进程名杀
     ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
 
-    # 按端口杀 (兜底: 可能有其他进程占用了我们的端口)
-    for port in 50050 50051 50052 50053 50054 50055 50056 50057 50058 9000; do
-        local pid=$(ss -tlnp 2>/dev/null | grep ":$port " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
-        [[ -n "$pid" ]] && { kill -9 "$pid" 2>/dev/null || true; }
-    done
+    # 按端口杀: 扫描所有 LISTEN 端口, 属于 distributed_compute 的一律杀掉
+    ss -tlnp 2>/dev/null | grep distributed_compute | \
+        sed -n 's/.*pid=\([0-9]*\).*/\1/p' | sort -u | \
+        xargs -r kill -9 2>/dev/null || true
     sleep 2
 
+    # 清理所有 minio 容器 (不管多少个)
     docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker stop  2>/dev/null || true
     docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker rm    2>/dev/null || true
+
+    # 清理所有 bench-minio 卷
     docker volume ls -q --filter "name=bench-minio" 2>/dev/null | xargs -r docker volume rm -f 2>/dev/null || true
     docker network rm bench-net 2>/dev/null || true
     sleep 2
 
-    # 最终校验
+    # 最终校验: 进程和容器清干净了就行
     local n=0
-    for port in 50050 50051 50053 50055 50057 9000; do
-        ss -tlnp 2>/dev/null | awk -v p="$port" '$4 ~ ":"p"$"' | grep -q . && n=$((n + 1))
-    done
-    [[ "$n" -eq 0 ]] || { fail "残留 $n 个端口占用"; exit 1; }
+    ps aux | grep distributed_compute | grep -v grep | grep -q . && n=$((n + 1))
+    docker ps -aq --filter "name=minio" 2>/dev/null | grep -q . && n=$((n + 1))
+    [[ "$n" -eq 0 ]] || { fail "残留 $n 类资源 (distributed_compute进程/minio容器)"; exit 1; }
     ok "干净"
 }
 
