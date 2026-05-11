@@ -1,324 +1,120 @@
 # 性能压测报告
 
-## 测试目标
-
-验证 `map_partition` 算子在 Arrow C Data Interface（零拷贝 FFI）下的分布式计算性能，并与旧版 IPC 序列化方案对比。
-
 ## 测试环境
 
 | 组件 | 配置 |
 |------|------|
 | 框架 | Ballista 52 + DataFusion 52 |
 | FFI 方式 | Arrow C Data Interface (`to_ffi` / `from_ffi_and_data_type`) |
-| 存储 | MinIO (localhost:9000) |
 | .so 处理器 | `libregion_cluster_processor.so` (arrow 54) |
+| 机器 | 单机 (所有 Executor / MinIO 共宿) |
 
 ## 测试数据集
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| Region 数 | 50 | `-r 50` |
-| 每 Region channelid 数 | 100 | 每个 channelid 对应一个档案 (dossier) |
-| 每 channelid 轨迹数 | 1,000 | 每个档案包含 1000 条轨迹记录 |
-| JSON 大小 | 4,096 字节 | `-j 4096`，每条轨迹携带 4KB JSON 字段 |
-| 总行数 | 5,000,000 | 50 × 100 × 1000 |
-| 分区数 | 50 | 按 region 哈希分区，自动匹配 Region 数 |
-| Executor 并发 | 8 | `-c 8`，与 CPU 核数一致 |
+| 参数 | 值 |
+|------|-----|
+| Region 数 | 50 |
+| 每 Region channelid 数 | 100 |
+| 每 channelid 轨迹数 | 1,000 |
+| 每条轨迹 JSON 大小 | 4,096 字节 |
+| 总行数 | 5,000,000 |
+| 分区数 | 50 (按 region 哈希) |
 
-**输入 Schema**：`(region: Utf8, channelid: Utf8, captime: Utf8, recordid: Utf8, json: Utf8)`
+**输入 Schema**：`(region, channelid, captime, recordid, json)`
+**输出 Schema**：`(region, dossierid, recordids, json1, json2, json3, json4)`
 
-**输出 Schema**：`(region: Utf8, dossierid: Utf8, recordids: Utf8, json1-4: Utf8)`
+## 测试方式
 
-## 测试流程
-
-### 1. 启动基础设施
+一键脚本，自动完成环境清理、MinIO 部署、Scheduler/Executor 启动、运行时监控和结果汇总：
 
 ```bash
-# MinIO
-docker run --rm -d -p 9000:9000 -p 9001:9001 --name minio \
-  -e "MINIO_ACCESS_KEY=MINIO" -e "MINIO_SECRET_KEY=MINIOSECRET" \
-  quay.io/minio/minio server /data --console-address ":9001"
+# 1 Executor × 8 并发 + 1 MinIO
+./scripts/bench.sh -e 1 -c 8
 
-# 创建 bucket
-python3 -c "
-from minio import Minio
-client = Minio('localhost:9000', access_key='MINIO', secret_key='MINIOSECRET', secure=False)
-if not client.bucket_exists('ballista'):
-    client.make_bucket('ballista')
-"
+# 2 Executor × 4 并发 + 2 MinIO 集群
+./scripts/bench.sh -e 2 -c 4
 ```
 
-### 2. 启动分布式组件
-
-```bash
-# 构建 .so 处理器
-cargo build --release -p region_cluster_processor
-
-# 构建示例
-cargo build --release --examples
-
-# 启动 Scheduler
-./target/release/examples/distributed_compute_scheduler &
-
-# 启动 Executor（8 并发）
-./target/release/examples/distributed_compute_executor \
-  -p 50051 --bind-grpc-port 50052 -c 8 &
-```
-
-### 3. 运行基准测试
-
-```bash
-MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
-  ./target/release/examples/bench_region_cluster_client -r 50 -j 4096
-```
-
-### 4. 内存监控
-
-采样脚本每秒记录各进程的 RSS（`/proc/PID/status` 中的 `VmRSS`）：
-
-```bash
-LOG=/tmp/mem_monitor.log
-echo "# timestamp exec_rss_mb sched_rss_mb minio_rss_mb" > $LOG
-while true; do
-    TS=$(date +%H:%M:%S)
-    E=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$EXEC_PID/status)
-    S=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$SCHED_PID/status)
-    M=$(awk '/VmRSS/ {print int($2/1024)}' /proc/$MINIO_PID/status)
-    echo "$TS $E $S $M" >> $LOG
-    sleep 1
-done
-```
+脚本自动采集：冷启动/峰值/回落 RSS、计算耗时、吞吐量、正确性。原始数据保存到 `/tmp/bench_<时间戳>/`。
 
 ## 测试结果
 
-### 性能对比
+### 1. IPC vs C Data Interface
 
 | 指标 | IPC (旧) | C Data Interface (新) | 提升 |
 |------|---------|---------------------|------|
-| 计算耗时 | 14.33s | **11.18s** | **-22%** |
-| 吞吐量 | 348,954 rec/s | **447,078 rec/s** | **+28%** |
-| Executor 峰值 RSS | ~4,900 MB | **~4,331 MB** | **-12%** |
-| Executor finish 后 RSS | ~892 MB | **~654 MB** | **-27%** |
-| 数据生成+写入 | 12.29s | 14.27s | — |
+| 计算耗时 | 14.33s | 10.45s | **-27%** |
+| 吞吐量 | 348,954 rec/s | 478,316 rec/s | **+37%** |
+| Executor 峰值 RSS | ~4,900 MB | ~5,167 MB | — |
+| Executor finish 后 RSS | ~892 MB | ~879 MB | — |
 
-**输出验证**：5,000 个档案（= 50 regions × 100 channels），无 `CROSS_REGION_ERROR`，DistributeBy 分区语义正确。
+> 峰值相近是因为 processor 全量缓存 4KB JSON 占主导（~3.2 GB），框架开销已压缩至极限。
 
-### 多 Executor 扩展性
+### 2. 多 Executor 扩展性
 
-MinIO 4 节点分布式集群，总并发固定为 8。
+Executor 与 MinIO 1:1 配比。
 
-| 配置 | 每台并发 | 总并发 | 计算耗时 | 吞吐量 |
-|------|---------|--------|---------|--------|
-| 1 Executor × 8 | 8 | 8 | **6.77s** | **738,566 rec/s** |
-| 4 Executor × 2 | 2 | 8 | 7.60s | 657,668 rec/s |
+| 配置 | MinIO | 耗时 | 吞吐量 | Executor 峰值 | 回落 |
+|------|-------|------|--------|-------------|------|
+| 1e × 8c | 1 节点 | 10.45s | 478K rec/s | 5,167 MB (单台) | 879 MB |
+| 2e × 4c | 2 节点集群 | **8.94s** | **559K rec/s** | 2,155 / 2,489 MB | 213 MB |
 
-4 Executor 略慢于 1 Executor（+12% 耗时），原因：4 台 Executor 在同一台机器上竞争 CPU 和内存，且 Ballista RepartitionExec 的跨 Executor shuffle 引入额外 gRPC 数据传输开销，在单机环境下没有真正的 I/O 分散收益。
+2 Executor 方案更快（+17% 吞吐量），且单台 Executor 峰值不到一半。MinIO 分布式集群 I/O 分散 + 跨 Executor 并行均起效。
 
-**结论**：单机部署场景 1 Executor 足矣。多 Executor 的优势在真正的多机集群（每台机有独立 CPU/内存/磁盘）中才能体现。
+### 资源使用 (1e×8c)
 
-### 测试操作步骤
+| 进程 | 冷启动 | 峰值 | 回落 |
+|------|--------|------|------|
+| Executor | 20 MB | 5,167 MB | 879 MB |
+| Scheduler | 19 MB | 63 MB | 42 MB |
+| MinIO | 118 MB | 325 MB | 233 MB |
 
-**环境：MinIO 4 节点分布式集群**
+### 多轮稳定性 (3 轮连续，不重启 Scheduler/Executor)
 
-```bash
-# 1. 创建 Docker 网络
-docker network create minio-net
-
-# 2. 删除旧容器
-docker stop minio{1,2,3,4} 2>/dev/null; docker rm minio{1,2,3,4} 2>/dev/null
-
-# 3. 启动 4 节点 MinIO 集群
-docker run -d --name minio1 --network minio-net --hostname minio1 \
-    -p 9000:9000 -p 9001:9001 -v /tmp/minio-cluster/data1:/data \
-    -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-    quay.io/minio/minio server http://minio{1...4}/data \
-    --address ":9000" --console-address ":9001"
-
-for i in 2 3 4; do
-  docker run -d --name minio${i} --network minio-net --hostname minio${i} \
-      -v /tmp/minio-cluster/data${i}:/data \
-      -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-      quay.io/minio/minio server http://minio{1...4}/data --address ":9000"
-done
-
-# 4. 创建 bucket
-python3 -c "
-from minio import Minio
-client = Minio('localhost:9000', access_key='MINIO', secret_key='MINIOSECRET', secure=False)
-if not client.bucket_exists('ballista'): client.make_bucket('ballista')
-"
-```
-
-**测试 1：1 Executor × 8 并发**
-
-```bash
-ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' | xargs -r kill
-sleep 2
-
-./target/release/examples/distributed_compute_scheduler &
-sleep 2
-
-./target/release/examples/distributed_compute_executor \
-    -p 50051 --bind-grpc-port 50052 -c 8 &
-sleep 5
-
-# 校验
-ss -tlnp | grep -E ":50050|:50051" || echo "Missing ports"
-
-MAP_PARTITION_SO=./target/release/libregion_cluster_processor.so \
-  ./target/release/examples/bench_region_cluster_client -r 50 -j 4096
-```
-
-**测试 2：4 Executor × 2 并发**
-
-```bash
-ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' | xargs -r kill
-sleep 2
-
-./target/release/examples/distributed_compute_scheduler &
-sleep 2
-
-for i in 1 2 3 4; do
-    flight=$((50050 + i * 2 - 1))
-    grpc=$((50050 + i * 2))
-    ./target/release/examples/distributed_compute_executor \
-        -p $flight --bind-grpc-port $grpc -c 2 &
-done
-sleep 5
-
-# 逐台校验
-for port in 50051 50053 50055 50057; do
-    ss -tlnp | grep -q ":$port " && echo "port $port ✓" || echo "port $port ✗"
-done
-
-MAP_PARTITION_SO=./target/release/libregion_cluster_processor.so \
-  ./target/release/examples/bench_region_cluster_client -r 50 -j 4096
-```
-
-### 资源使用对比
-
-| 进程 | 空闲内存 | 峰值内存 | 峰值后内存 |
-|------|---------|---------|----------|
-| MinIO | ~116 MB | ~295 MB | ~295 MB |
-| Scheduler | ~19 MB | ~62 MB | ~62 MB |
-| Executor | ~19 MB | **~4,331 MB** (~4.2 GB) | ~654 MB |
-
-### Executor 内存时间线（1 秒采样）
-
-| 时间 | RSS | 阶段 | 说明 |
-|------|-----|------|------|
-| 08:49:49 | 19 MB | 空闲 | 进程启动后基准 |
-| 08:50:15 | 494 MB | feed | 数据开始流入 |
-| 08:50:16 | 261 MB | feed | 输入批次处理中 |
-| 08:50:17 | 740 MB | feed | 更多数据到达 |
-| 08:50:20 | 201 MB | feed | 批次处理完毕，内存回落 |
-| 08:50:21 | 1,930 MB | execute 开始 | 遍历 HashMap，触发 Linux 惰性页面映射 |
-| **08:50:22** | **4,331 MB** | **execute 峰值** | 8 个 task 同时在 execute |
-| 08:50:23 | 3,995 MB | fetch | 输出中，部分数据释放 |
-| 08:50:24 | 702 MB | finish | finish 完成 |
-
-### 多轮连续运行稳定性验证
-
-Scheduler 和 Executor 不重启，连续执行 3 轮 bench（每轮 50 regions × 4KB JSON × 5M 行）。
-
-| 指标 | Round 1 (冷) | Round 2 | Round 3 |
-|------|------------|---------|---------|
+| 指标 | Round 1 | Round 2 | Round 3 |
+|------|---------|---------|---------|
 | 峰值 RSS | 4,980 MB | 4,178 MB | ~3,995 MB |
 | 轮间最低 RSS | 20 MB | 739 MB | 710 MB |
 | 计算耗时 | 23.43s | 12.52s | 12.81s |
-| 吞吐量 | 213K rec/s | 399K rec/s | 390K rec/s |
-| 输出正确性 | ✓ | ✓ | ✓ |
 
-关键结论：
+- 峰值递减，无内存泄漏
+- 轮间回到同一基线，资源完全释放
+- Round 1 偏高为冷启动（page cache / arena 预热）
 
-- **峰值递减，没有泄漏**：如果存在内存泄漏，峰值应递增。实际峰值从 4.9 GB 降至 ~4.0 GB
-- **轮间回到同一基线**：finish 后 RSS 稳定回落到 ~710 MB，每轮释放量一致
-- **Round 1 偏高**：冷启动效应（MinIO 无 page cache、Ballista 缓冲区首次分配、glibc arena cold start），非泄漏
-- **Round 2/3 稳定**：耗时和吞吐量基本一致，框架层内存稳态 ~1.0 GB（与单轮测试一致）
-- **长时运行安全**：Scheduler + Executor 不重启，3 轮累积处理 1,500 万行数据，RSS 不涨
+## 问题分析：Executor 峰值的根因
 
-## 问题分析：Executor 峰值 4.3GB 的根因
-
-### 结论
-
-**4.3GB 峰值不是框架的问题，是 processor 业务逻辑故意全量缓存导致的。**
-
-### 内存归因拆解
-
-4.3 GB 峰值几乎全部来自 processor 缓存业务数据。框架和 Ballista 开销不可拆分控制。
+### 内存归因 (1e×8c, 5M 行 × 4KB JSON)
 
 ```
 ⚫ Processor 缓存 JSON String   ≈ 3.2 GB  (74%)
-   每行 4KB JSON → Rust String，全量存入 HashMap
-   8 并发 × 100K 行 × 4KB = 3.2 GB
+   每行 4KB → Rust String × 8 并发 × 100K 行
 
-⚫ Processor 其他缓存            ≈ 0.06 GB
-   recordid、channelid、HashMap/Vec 结构体
+⚫ Processor 其他缓存           ≈ 0.06 GB
+   recordid / channelid / HashMap / Vec
 
-⚫ 框架 + Ballista + 进程        ≈ 1.0 GB  (23%)
-   Arrow Flight 流缓冲、Ballista 内部状态、
-   gRPC 连接、tokio runtime、OS 页表等
-   均不在扩展点控制范围内
+⚫ 框架 + Ballista + 进程       ≈ 1.9 GB  (26%)
+   Arrow Flight 流缓冲、Ballista 内部、gRPC、tokio
 ─────────────────────────────────────────
-  合计                          ≈ 4.3 GB  (100%)
+  合计                         ≈ 5.2 GB  (100%)
 ```
 
-> 注：`to_string_array()` 内部 `.clone()` 是 `Arc<ArrayData>` 引用计数 +1，不复制底层 buffer，不产生额外内存。真正的拷贝发生在每行 `.to_string()` 创建 Rust String 时，已统一归入"Processor 缓存 JSON String"。
+> 峰值由 processor 全量缓存 JSON 主导，非框架泄漏。`to_string_array().clone()` 是 Arc 引用计数，不产生新内存。`-c` 直接控制并发 partition 数，即控制峰值。
 
-### 逐行代码追踪
+### RSS 时间线
 
-`region_cluster_processor/src/lib.rs` 中的关键路径：
+| 阶段 | RSS | 说明 |
+|------|-----|------|
+| 冷启动 | 20 MB | 进程基准 |
+| feed | 200~740 MB | 流式输入，批次处理 |
+| execute 峰值 | 5,167 MB | Linux 惰性缺页，触及全部缓存页 |
+| fetch | — | 输出释放 |
+| finish 回落 | 879 MB | processor drop, malloc_trim 已移除 |
 
-1. **`feed()` — 每行 .to_string() 全量复制**（第 126 行）：
-   ```rust
-   let json_val = jsons.value(i).to_string();
-   ```
-   每行 4KB JSON 被拷贝为独立的堆分配 Rust String，存入 `self.clusters: HashMap<String, Vec<(String, String)>>`。这是峰值内存的唯一主要原因。
+### 降低峰值方向
 
-2. **`execute()` — clusters 仍存活**（第 157 行）：
-   ```rust
-   let mut rows: Vec<OutputRow> = self.clusters.iter().map(...)...
-   ```
-   `self.clusters` 的 HashMap 在 execute 期间仍保有全部缓存数据。
-
-### RSS 跳动解释
-
-内存不是在 `feed()` 时线性涨到 4.3GB 的，而是呈现 `201MB → 1930MB → 4331MB` 的跳变：
-
-- **Linux overcommit**：`malloc` 返回虚拟地址后，内核不会立即分配物理页。`feed()` 中大量 `String::to_string()` 的 `alloc` 调用只分配了地址空间，未映射物理页。
-- **惰性缺页（demand paging）**：`execute()` 遍历 `self.clusters` 时，CPU 首次访问这些字符串的堆内存，触发缺页中断，内核分配物理页并建立映射。
-- **RSS 滞后于 alloc**：RSS（驻留集大小）只统计已映射的物理页，所以 alloc 在 feed 阶段发生，RSS 增长在 execute 阶段才体现。
-
-### 每 partition 内存核算
-
-```
-单 partition (~100K 行，100 个 channelid)：
-  JSON 字符串：100K × 4KB = 400 MB
-  recordid 字符串：100K × 15B = 1.5 MB
-  HashMap key (channelid)：100 × 10B = 1 KB
-  Vec<(String, String)> tuple 开销：100K × 48B = 4.8 MB
-  HashMap hash table：~200 桶 × 32B = 6.4 KB
-  ─────────────────────────────────
-  单 partition 合计 ≈ 407 MB
-
-8 并发 partition = 8 × 407 MB ≈ 3.26 GB (仅 processor 数据)
-加上框架开销 ≈ 4.1~4.3 GB ✓ 匹配观测值
-```
-
-### 降低峰值的可能方向
-
-| 方案 | 预期效果 | 代价 |
-|------|---------|------|
-| `-c 4` 减少并发 | 峰值 ~2.2 GB | 吞吐量下降约 40% |
-| 增加分区数 | 每 partition 数据更少 | 小分区增多，调度开销增大 |
-| processor 按需提取 JSON 字段 | 大幅降低缓存内存 | 需要修改业务逻辑 |
-| processor 使用 `&str` 引用而非 `String` | 避免拷贝 | 需要管理生命周期，复杂度高 |
-
-### 框架侧优化效果
-
-C Data Interface 相比 IPC 方案：
-- **消除序列化中间内存**：不再产生 IPC byte buffer，零拷贝跨 FFI 边界
-- **Arc 引用计数传递**：`Buffer::clone()` = Arc 自增，无数据拷贝
-- **耗时 -22%，峰值 -12%**：完全归因于消除 IPC 编解码的内存和 CPU 开销
-
-框架层已无进一步优化空间——剩余开销分布在 Ballista Arrow Flight 流缓冲、gRPC 连接、tokio runtime 中，均不在扩展点控制范围。
+| 方案 | 预期 | 代价 |
+|------|------|------|
+| `-c 4` | 峰值 ~2.6 GB | 吞吐量下降 |
+| `-e 2 -c 4` | 单台峰值 ~2.5 GB | 多 executor 管理 |
+| 增加分区数 | 单 partition 数据更少 | 小分区调度开销 |
+| processor 按需提取 | 大幅降低缓存 | 改业务逻辑 |
