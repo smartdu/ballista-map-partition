@@ -39,7 +39,8 @@ ballista-map-partition/
 ```bash
 # 构建 .so 处理器
 cargo build --release -p region_cluster_processor
-# 产出：target/release/libregion_cluster_processor.so
+cargo build --release -p noop_processor
+# 产出：target/release/libregion_cluster_processor.so 和 libnoop_processor.so
 
 # 构建所有示例
 cargo build --release --examples
@@ -59,14 +60,24 @@ cargo build --release --examples
 | 处理器 | 说明 |
 |--------|------|
 | `region_cluster_processor` | 按 channelid 聚类生成 dossier，检测 CROSS_REGION_ERROR |
+| `noop_processor` | 空处理器，丢弃所有输入不产生输出 — 用于压测框架开销 |
 
 ### DistributeBy API
 
 ```rust
-df.map_partition(&so_path, "processor", output_schema)?
+let so_path = std::env::var("MAP_PARTITION_SO").unwrap_or_else(|_| default_so);
+let fn_name = std::env::var("MAP_PARTITION_FN").unwrap_or_else(|_| default_fn);
+df.map_partition(&so_path, &fn_name, output_schema)?
   .with_distribute_by(col("region"), 100)?   // 相同 region → 同一 processor
   .build()?;
 ```
+
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MAP_PARTITION_SO` | `target/release/libregion_cluster_processor.so` | `.so` 动态库路径 |
+| `MAP_PARTITION_FN` | `region_cluster_processor` | `.so` 中的函数名前缀 |
 
 ### 运行示例：Region 聚类
 
@@ -93,9 +104,14 @@ cargo run --release --example distributed_compute_scheduler
 # 4. 启动 Executor（新终端）
 cargo run --release --example distributed_compute_executor
 
-# 5. 运行 Client
+# 5. 运行 Client (可选 MAP_PARTITION_FN 指定函数名前缀)
 MAP_PARTITION_SO=target/release/libregion_cluster_processor.so \
   cargo run --release --example region_cluster_client
+
+# 使用 noop 处理器压测框架开销
+MAP_PARTITION_FN=noop_processor \
+MAP_PARTITION_SO=target/release/libnoop_processor.so \
+  cargo run --release --example bench_region_cluster_client -- -r 1
 ```
 
 预期输出（无 `CROSS_REGION_ERROR` 表示 DistributeBy 分区正确）：

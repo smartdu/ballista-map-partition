@@ -105,11 +105,14 @@ async fn main() -> datafusion::common::Result<()> {
     let so_path = std::env::var("MAP_PARTITION_SO")
         .unwrap_or_else(|_| "target/release/libregion_cluster_processor.so".to_string());
 
+    let fn_name = std::env::var("MAP_PARTITION_FN")
+        .unwrap_or_else(|_| "region_cluster_processor".to_string());
+
     // 使用 with_distribute_by 声明按 region 做 DistributeBy 分区
     // 语义：相同 region 进入同一个 processor，不同 region 进入不同 processor
     // 自定义优化规则 EnforceDistributeBy 会强制插入 RepartitionExec
     let df = df
-        .map_partition(&so_path, "region_cluster_processor", output_schema)?
+        .map_partition(&so_path, &fn_name, output_schema)?
         .with_distribute_by(col("region"), NUM_PARTITIONS)?
         .build()?;
 

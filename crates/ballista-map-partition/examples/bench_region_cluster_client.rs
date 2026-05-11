@@ -258,8 +258,11 @@ async fn main() -> datafusion::common::Result<()> {
     let so_path = std::env::var("MAP_PARTITION_SO")
         .unwrap_or_else(|_| "target/release/libregion_cluster_processor.so".to_string());
 
+    let fn_name = std::env::var("MAP_PARTITION_FN")
+        .unwrap_or_else(|_| "region_cluster_processor".to_string());
+
     let df = df
-        .map_partition(&so_path, "region_cluster_processor", output_schema)?
+        .map_partition(&so_path, &fn_name, output_schema)?
         .with_distribute_by(col("region"), num_partitions)?
         .build()?;
 
