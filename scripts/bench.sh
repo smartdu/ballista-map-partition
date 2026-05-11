@@ -171,10 +171,12 @@ ROWS=$(grep  "输出行数"         "$OUTDIR/bench.log" | head -1 | awk -F': ' '
 CROSS=$(grep -c "无 CROSS_REGION_ERROR" "$OUTDIR/bench.log" || true)
 
 # Executor: 所有 executor 列的最大值/平均值
-ncols=$(head -1 "$MON_CSV" | awk '{print NF}')
-last_col=$((ncols))
-exec_cols=$((ncols - 2))
-PEAK_EXEC=$(awk "NR>1 {for(i=2;i<=${exec_cols}+1;i++) if(\$i+0>m[i]) m[i]=\$i} END{for(i=2;i<=${exec_cols}+1;i++) printf \"%d \", m[i]}" "$MON_CSV")
+PEAK_EXEC=""
+for i in $(seq 1 $E); do
+    p=$(awk "NR>1 {if(\$((i+1))+0>m) m=\$((i+1))} END{printf \"%d\", m}" "$MON_CSV")
+    PEAK_EXEC="$PEAK_EXEC $p"
+done
+PEAK_EXEC=$(echo $PEAK_EXEC | xargs)
 PEAK_SCHED=$(awk "NR>1 {if(\$(NF-1)+0>m) m=\$(NF-1)} END{printf \"%d\", m}" "$MON_CSV")
 PEAK_MINIO=$(awk "NR>1 {if(\$NF+0>m) m=\$NF} END{printf \"%d\", m}" "$MON_CSV")
 BASE_EXEC=$(head -2 "$MON_CSV" | tail -1 | awk '{printf "%d", $2}')
