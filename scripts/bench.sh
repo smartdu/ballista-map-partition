@@ -208,6 +208,8 @@ sleep 2
 # ============================================================
 MONDATA="$OUTDIR/monitor.csv"
 BASELINE_EXEC=$(awk 'NR==2 {print $2}' "$MONDATA")
+BASELINE_SCHED=$(awk 'NR==2 {print $(NF-1)}' "$MONDATA")
+BASELINE_MINIO=$(awk 'NR==2 {print $NF}' "$MONDATA")
 PEAK_EXEC=$(awk 'NR>1 {for(i=2;i<=NF-2;i++) if($i+0>m[i]) m[i]=$i} END{for(i=2;i<=NF-2;i++) printf "%d ", m[i]}' "$MONDATA")
 PEAK_SCHED=$(awk 'NR>1 {if($(NF-1)+0>m) m=$(NF-1)} END{printf "%d", m}' "$MONDATA")
 PEAK_MINIO=$(awk 'NR>1 {if($NF+0>m) m=$NF} END{printf "%d", m}' "$MONDATA")
