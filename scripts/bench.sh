@@ -18,11 +18,11 @@ E=1 C=8 REGIONS=50 JSON=4096
 
 while getopts "e:c:r:j:h" opt; do
     case $opt in
-        e) E="$OPTARG"; [[ "$E" =~ ^[1-9]$|^10$ ]] || { echo "错误: -e 1-10"; exit 1; } ;;
+        e) E="$OPTARG"; [[ "$E" =~ ^[1-9][0-9]?$|^100$ ]] || { echo "错误: -e 1-100"; exit 1; } ;;
         c) C="$OPTARG"; [[ "$C" -ge 1 ]] || { echo "错误: -c >= 1"; exit 1; } ;;
         r) REGIONS="$OPTARG" ;;
         j) JSON="$OPTARG" ;;
-        *) echo "用法: $0 [-e 1|2|3|4] [-c concurrent] [-r regions] [-j json_bytes]"; exit 1 ;;
+        *) echo "用法: $0 [-e 1-100] [-c concurrent] [-r regions] [-j json_bytes]"; exit 1 ;;
     esac
 done
 
