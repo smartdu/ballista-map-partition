@@ -152,8 +152,8 @@ start_monitor() {
         ss -tlnp | grep ":$flight " | sed -n 's/.*pid=\([0-9]*\).*/\1/p'
     done | tr '\n' ' ')
     local sched_pid=$(ss -tlnp | grep ":50050 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
-    local minio_pid=$(docker inspect minio 2>/dev/null | sed -n 's/.*"Pid":\([0-9]*\).*/\1/p' | head -1)
-    [[ -z "$minio_pid" ]] && minio_pid=$(docker inspect minio1 2>/dev/null | sed -n 's/.*"Pid":\([0-9]*\).*/\1/p' | head -1)
+    local minio_pid=$(docker inspect minio 2>/dev/null | sed -n 's/.*"Pid": *\([0-9]*\).*/\1/p' | head -1)
+    [[ -z "$minio_pid" ]] && minio_pid=$(docker inspect minio1 2>/dev/null | sed -n 's/.*"Pid": *\([0-9]*\).*/\1/p' | head -1)
 
     echo "#ts $(echo $exec_pids | sed 's/ /_rss /g')_rss sched_rss minio_rss" > "$OUTDIR/monitor.csv"
 
