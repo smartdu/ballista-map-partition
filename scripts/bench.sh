@@ -84,7 +84,7 @@ clean_all() {
     # 确认端口全部释放
     sleep 2
     for port in 50050 50051 50052 50053 50054 50055 50056 50057 50058 9000; do
-        local pid=$(ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\K\d+' || true)
+        local pid=$(ss -tlnp 2>/dev/null | grep ":$port " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' || true)
         if [ -n "$pid" ]; then
             warn "端口 $port 仍被 pid=$pid 占用，强制释放"
             kill -9 $pid 2>/dev/null || true
@@ -176,14 +176,7 @@ if not c.bucket_exists('ballista'): c.make_bucket('ballista')
 # Executor 启动
 # ============================================================
 start_executors() {
-    local n=$1; local label=$2; local ports=""
-
-    # 构建端口列表
-    for i in $(seq 1 $n); do
-        local flight=$((50050 + i * 2 - 1))
-        local grpc=$((50050 + i * 2))
-        ports="$ports $flight"
-    done
+    local n=$1; local label=$2; local ports="$3"
 
     ok "启动 $n 个 Executor (各 $CONCURRENT 并发, 总并发 $TOTAL_TASKS)..."
     for i in $(seq 1 $n); do
@@ -194,7 +187,6 @@ start_executors() {
     sleep $((4 + n * 2))
 
     assert_ports "Executor" $ports
-    echo "$ports"  # return for monitoring
 }
 
 # ============================================================
@@ -290,9 +282,14 @@ main() {
     sleep 3
     assert_ports "Scheduler" 50050
 
-    local ports=$(start_executors $N_EXEC $label)
+    # 构建端口列表
+    local exec_ports=""
+    for i in $(seq 1 $N_EXEC); do
+        exec_ports="$exec_ports $((50050 + i * 2 - 1))"
+    done
+    start_executors $N_EXEC $label "$exec_ports"
 
-    run_bench "$label" $ports
+    run_bench "$label" $exec_ports
 
     # 汇总
     ok "========== 结果 =========="
