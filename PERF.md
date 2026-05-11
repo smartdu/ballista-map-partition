@@ -2,11 +2,16 @@
 
 ## 测试环境
 
-| 组件 | 配置 |
+| 项目 | 配置 |
 |------|------|
-| 框架 | Ballista 52 + DataFusion 52 — Arrow C Data Interface 零拷贝 |
+| OS | Linux 6.6.98 x86_64 |
+| CPU | AMD EPYC 9K85 128-Core × 64 cores |
+| Memory | 246 GiB |
+| Rust | 1.93.0 |
+| Docker | 27.5.1 |
+| 框架 | Ballista 52 + DataFusion 52 — Arrow C Data Interface |
 | .so 处理器 | `libregion_cluster_processor.so` (arrow 54) |
-| 部署 | 单机，Executor / MinIO 共宿 |
+| 部署 | 单机，所有进程共宿 |
 
 ## 数据集
 
