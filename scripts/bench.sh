@@ -36,7 +36,7 @@ done
 
 TOTAL_ROWS=$((REGIONS * 100 * 1000))
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTDIR="/tmp/bench_${TIMESTAMP}_e${E}_n${N}_r${REGIONS}_j${JSON}"
+OUTDIR="/tmp/bench_${TIMESTAMP}_e${E}_c${C}_r${REGIONS}_j${JSON}"
 mkdir -p "$OUTDIR"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
