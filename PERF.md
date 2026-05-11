@@ -24,6 +24,11 @@
 ## 一键测试
 
 ```bash
+# 编译
+cargo build --release -p region_cluster_processor
+cargo build --release --examples
+
+# 测试
 ./scripts/bench.sh -e 1 -c 8   # 1 Executor × 8 并发 + 1 MinIO
 ./scripts/bench.sh -e 2 -c 4   # 2 Executor × 4 并发 + 2 MinIO 集群
 ```
