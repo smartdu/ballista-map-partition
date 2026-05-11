@@ -34,8 +34,9 @@ clean_all() {
         echo "$containers" | xargs -r docker rm 2>/dev/null || true
     fi
 
-    # 删除测试用网络
+    # 删除测试用网络 + 清理 MinIO 数据目录
     docker network rm bench-net 2>/dev/null || true
+    rm -rf /tmp/bench-data
 
     # 确认端口释放
     sleep 2
@@ -129,7 +130,7 @@ if not c.bucket_exists('ballista'): c.make_bucket('ballista')
     assert_ports "Executor" 50051
 
     # --- 压测 ---
-    run_bench "$label"
+    run_bench "$label" "50051"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -161,9 +162,16 @@ test_4x2_4minio() {
     done
     sleep 8
 
-    # 校验 4 个容器都在运行
+    # 校验 4 个容器都在运行，如果少了打印详细信息
     local minio_up=$(docker ps --filter "name=minio" --format "{{.Names}}" | wc -l)
-    [ "$minio_up" -eq 4 ] || { fail "MinIO 容器: 预期 4 实际 $minio_up"; exit 1; }
+    if [ "$minio_up" -ne 4 ]; then
+        fail "MinIO 容器: 预期 4 实际 $minio_up"
+        docker ps -a --filter "name=minio" --format "{{.Names}} {{.Status}}"
+        for c in minio1 minio2 minio3 minio4; do
+            docker logs "$c" 2>&1 | tail -3
+        done
+        exit 1
+    fi
     ok "  4 个 MinIO 容器全部运行"
 
     python3 -c "
@@ -189,7 +197,7 @@ if not c.bucket_exists('ballista'): c.make_bucket('ballista')
     assert_ports "Executor" 50051 50053 50055 50057
 
     # --- 压测 ---
-    run_bench "$label"
+    run_bench "$label" "50051 50053 50055 50057"
 }
 
 # ────────────────────────────────────────────────────────────
@@ -197,13 +205,48 @@ if not c.bucket_exists('ballista'): c.make_bucket('ballista')
 # ────────────────────────────────────────────────────────────
 run_bench() {
     local label=$1
+    local ports=$2  # space-separated list of executor ports to monitor
     local logfile="/tmp/bench_${label}.log"
     ok "===== 开始压测: $label ====="
+
+    # 后台进程监控：每 2 秒校验 executor 端口是否存活
+    (
+        while true; do
+            sleep 2
+            local dead=""
+            for port in $ports; do
+                if ! ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                    dead="$dead $port"
+                fi
+            done
+            if [ -n "$dead" ]; then
+                fail "⚠ 运行时检测到 Executor 端口下线: $dead"
+            fi
+        done
+    ) &
+    local mon_pid=$!
+
     MAP_PARTITION_SO="$SO" "$BENCH" -r 50 -j 4096 2>&1 | tee "$logfile"
 
+    # 停止监控
+    kill $mon_pid 2>/dev/null || true
+    wait $mon_pid 2>/dev/null || true
+
+    # 运行后再次校验
+    ok "  运行后校验 Executor 状态..."
+    local alive=0
+    for port in $ports; do
+        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+            alive=$((alive + 1))
+        else
+            fail "    $port ✗ 已下线"
+        fi
+    done
+    ok "  $alive 台 Executor 存活"
+
     # 提取关键结果
-    local ok_str=$(grep -c "CROSS_REGION_ERROR" "$logfile" || true)
-    if [ "$ok_str" -eq 0 ]; then
+    local ok_str=$(grep "无 CROSS_REGION_ERROR" "$logfile" | wc -l)
+    if [ "$ok_str" -ge 1 ]; then
         ok "✅ 正确性: 无 CROSS_REGION_ERROR"
     else
         fail "❌ 检测到 CROSS_REGION_ERROR!"
