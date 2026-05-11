@@ -3,36 +3,35 @@ set -euo pipefail
 
 # ============================================================
 # 用法:
-#   ./scripts/bench.sh -n 1                 # 1 Executor
-#   ./scripts/bench.sh -n 4                 # 4 Executor
-#   ./scripts/bench.sh -n 1 -r 10 -j 1024  # 自定义数据量
+#   ./scripts/bench.sh -n 1 -r 50 -j 4096
+#   ./scripts/bench.sh -n 4 -r 10 -j 1024
+#
+# 参数:
+#   -n  并发数 (Ballista concurrent_tasks, 即同时跑的 partition 数)
+#   -r  Region 数   (= 分区数, 总行数 = r × 100 × 1000)
+#   -j  JSON 大小 (字节, 每条轨迹的 payload)
 # ============================================================
 
-N_EXEC=1          # Executor 数量 (1-4)
-REGIONS=50        # Region 数
-JSON_SIZE=4096    # JSON 大小 (字节)
-CONCURRENT=8      # 每 Executor 并发 (自动: 8/n)
+N_TASKS=8
+REGIONS=50
+JSON=4096
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        -n) N_EXEC="$2"; shift 2 ;;
-        -r) REGIONS="$2"; shift 2 ;;
-        -j) JSON_SIZE="$2"; shift 2 ;;
-        *) echo "用法: $0 -n <1|4> [-r regions] [-j json_bytes]"; exit 1 ;;
+usage() { echo "用法: $0 -n <concurrent_tasks> [-r regions] [-j json_bytes]"; exit 1; }
+while getopts "n:r:j:h" opt; do
+    case $opt in
+        n) N_TASKS="$OPTARG" ;;
+        r) REGIONS="$OPTARG" ;;
+        j) JSON="$OPTARG" ;;
+        *) usage ;;
     esac
 done
 
-# 校验
-if [[ ! "$N_EXEC" =~ ^(1|2|3|4)$ ]]; then
-    echo "错误: -n 必须是 1-4"
-    exit 1
-fi
+[[ "$N_TASKS" -ge 1 ]] || usage
 
-# 自动计算每 executor 并发数 (总并发 ≈ 8)
-CONCURRENT=$((8 / N_EXEC))
-[[ $CONCURRENT -lt 1 ]] && CONCURRENT=1
-
-TOTAL_TASKS=$((N_EXEC * CONCURRENT))
+TOTAL_ROWS=$((REGIONS * 100 * 1000))
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTDIR="/tmp/bench_${TIMESTAMP}_n${N_TASKS}_r${REGIONS}_j${JSON}"
+mkdir -p "$OUTDIR"
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BENCH="$PROJECT_DIR/target/release/examples/bench_region_cluster_client"
@@ -40,264 +39,165 @@ SCHED="$PROJECT_DIR/target/release/examples/distributed_compute_scheduler"
 EXEC="$PROJECT_DIR/target/release/examples/distributed_compute_executor"
 SO="$PROJECT_DIR/target/release/libregion_cluster_processor.so"
 
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; N='\033[0m'
-ok()   { echo -e "${G}[$(date +%H:%M:%S)]${N} $*"; }
-warn() { echo -e "${Y}[$(date +%H:%M:%S)]${N} $*"; }
-fail() { echo -e "${R}[$(date +%H:%M:%S)]${N} $*"; }
+R='\033[0;31m'; G='\033[0;32m'; N='\033[0m'
+ok()   { echo -e "${G}[$(date +%H:%M:%S)]${N} $*" | tee -a "$OUTDIR/script.log"; }
+fail() { echo -e "${R}[$(date +%H:%M:%S)]${N} $*" | tee -a "$OUTDIR/script.log"; }
 
 # ============================================================
-# 编译检查
+# 检查二进制
 # ============================================================
-check_binaries() {
-    for bin in "$BENCH" "$SCHED" "$EXEC" "$SO"; do
-        if [[ ! -f "$bin" ]]; then
-            fail "缺少二进制: $bin"
-            fail "请先执行: cargo build --release -p region_cluster_processor && cargo build --release --examples"
-            exit 1
-        fi
-    done
-    ok "二进制文件检查通过"
-}
+for bin in "$BENCH" "$SCHED" "$EXEC" "$SO"; do
+    [[ -f "$bin" ]] || { fail "缺少: $bin"; exit 1; }
+done
 
 # ============================================================
-# 环境清理
+# 清理
 # ============================================================
-clean_all() {
-    ok "=== 环境清理 ==="
-    local pids=$(ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' || true)
-    if [ -n "$pids" ]; then
-        warn "残留进程: $pids"
-        for pid in $pids; do kill -9 $pid 2>/dev/null || true; done
-        sleep 3
-    fi
+ok "=== 清理环境 ==="
+ps aux | grep distributed_compute | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+sleep 2
+docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker stop 2>/dev/null || true
+docker ps -aq --filter "name=minio" 2>/dev/null | xargs -r docker rm 2>/dev/null || true
+docker network rm bench-net 2>/dev/null || true
+rm -rf /tmp/bench-data
+sleep 2
 
-    local containers=$(docker ps -aq --filter "name=minio" 2>/dev/null || true)
-    if [ -n "$containers" ]; then
-        warn "残留容器: $containers"
-        echo "$containers" | xargs -r docker stop 2>/dev/null || true
-        echo "$containers" | xargs -r docker rm 2>/dev/null || true
-    fi
-
-    docker network rm bench-net 2>/dev/null || true
-    rm -rf /tmp/bench-data
-
-    # 确认端口全部释放
-    sleep 2
-    for port in 50050 50051 50052 50053 50054 50055 50056 50057 50058 9000; do
-        local pid=$(ss -tlnp 2>/dev/null | grep ":$port " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' || true)
-        if [ -n "$pid" ]; then
-            warn "端口 $port 仍被 pid=$pid 占用，强制释放"
-            kill -9 $pid 2>/dev/null || true
-        fi
-    done
-    sleep 1
-    ok "环境清理完成"
-}
-
-assert_clean() {
-    local leftover=$(ps aux | grep distributed_compute | grep -v grep | wc -l)
-    [[ "$leftover" -eq 0 ]] || { fail "仍有 $leftover 个 distributed_compute 进程残留"; exit 1; }
-    for port in 50050 50051 50053 50055 50057; do
-        ss -tlnp 2>/dev/null | grep -q ":$port " && { fail "端口 $port 仍被占用"; exit 1; } || true
-    done
-    ok "环境干净"
-}
+# 确认干净
+LEFTOVER=$(ps aux | grep distributed_compute | grep -v grep | wc -l)
+[[ "$LEFTOVER" -eq 0 ]] || { fail "残留 $LEFTOVER 个进程"; exit 1; }
+ok "环境干净"
 
 # ============================================================
-# 端口校验
+# 启动 MinIO 单节点
 # ============================================================
-assert_ports() {
-    local desc=$1; shift; local want=$#; local got=0
-    ok "  $desc (预期 $want 个)"
-    for port in "$@"; do
-        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
-            ok "    $port ✓"; got=$((got + 1))
-        else
-            fail "    $port ✗"
-        fi
-    done
-    [[ "$got" -eq "$want" ]] || { fail "预期 $want 个端口，实际 $got 个"; exit 1; }
-    ok "  $got/$want 就绪"
-}
+ok "=== 启动 MinIO ==="
+docker network create bench-net 2>/dev/null || true
+docker run -d --name minio --network bench-net \
+    -p 9000:9000 -p 9001:9001 \
+    -v /tmp/bench-data/minio:/data \
+    -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
+    quay.io/minio/minio server /data \
+    --address ":9000" --console-address ":9001" > /dev/null
+sleep 5
 
-# ============================================================
-# MinIO 启动
-# ============================================================
-start_minio() {
-    local nodes=$1
-    docker network create bench-net 2>/dev/null || true
-    mkdir -p /tmp/bench-data/minio{1,2,3,4}
-
-    if [[ "$nodes" -eq 1 ]]; then
-        ok "启动 MinIO 单节点..."
-        docker run -d --name minio --network bench-net \
-            -p 9000:9000 -p 9001:9001 \
-            -v /tmp/bench-data/minio1:/data \
-            -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-            quay.io/minio/minio server /data \
-            --address ":9000" --console-address ":9001" > /dev/null
-        sleep 5
-    else
-        ok "启动 MinIO ${nodes} 节点集群..."
-        docker run -d --name minio1 --network bench-net --hostname minio1 \
-            -p 9000:9000 -v /tmp/bench-data/minio1:/data \
-            -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-            quay.io/minio/minio server http://minio{1...4}/data \
-            --address ":9000" > /dev/null
-
-        for i in 2 3 4; do
-            docker run -d --name minio${i} --network bench-net --hostname minio${i} \
-                -v /tmp/bench-data/minio${i}:/data \
-                -e MINIO_ROOT_USER=MINIO -e MINIO_ROOT_PASSWORD=MINIOSECRET \
-                quay.io/minio/minio server http://minio{1...4}/data \
-                --address ":9000" > /dev/null
-        done
-        sleep 8
-
-        local up=$(docker ps --filter "name=minio" --format "{{.Names}}" | wc -l)
-        if [[ "$up" -ne "$nodes" ]]; then
-            fail "MinIO 容器: 预期 $nodes 实际 $up"
-            docker ps -a --filter "name=minio" --format "{{.Names}} {{.Status}}"
-            for c in minio1 minio2 minio3 minio4; do
-                echo "--- $c ---"; docker logs "$c" 2>&1 | tail -3
-            done
-            exit 1
-        fi
-    fi
-
-    python3 -c "
+python3 -c "
 from minio import Minio
 c=Minio('localhost:9000',access_key='MINIO',secret_key='MINIOSECRET',secure=False)
 if not c.bucket_exists('ballista'): c.make_bucket('ballista')
-" && ok "  MinIO + bucket 就绪" || { fail "MinIO 启动失败"; exit 1; }
+" && ok "MinIO 就绪" || { fail "MinIO 失败"; exit 1; }
+
+# ============================================================
+# 启动 Scheduler + Executor
+# ============================================================
+ok "=== 启动 Scheduler ==="
+"$SCHED" > "$OUTDIR/scheduler.log" 2>&1 &
+sleep 2
+ss -tlnp | grep -q ":50050 " || { fail "Scheduler 未启动"; exit 1; }
+SCHED_PID=$(ss -tlnp | grep ":50050 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+ok "Scheduler PID=$SCHED_PID"
+
+ok "=== 启动 Executor (concurrent_tasks=$N_TASKS) ==="
+"$EXEC" -p 50051 --bind-grpc-port 50052 -c "$N_TASKS" > "$OUTDIR/executor.log" 2>&1 &
+sleep 5
+ss -tlnp | grep -q ":50051 " || { fail "Executor 未启动"; exit 1; }
+EXEC_PID=$(ss -tlnp | grep ":50051 " | sed -n 's/.*pid=\([0-9]*\).*/\1/p')
+ok "Executor PID=$EXEC_PID"
+
+# ============================================================
+# 系统监控 (后台)
+# ============================================================
+get_rss_all() {
+    local exec_rss=$(awk '/VmRSS/ {printf "%d", $2/1024}' /proc/$EXEC_PID/status 2>/dev/null || echo 0)
+    local sched_rss=$(awk '/VmRSS/ {printf "%d", $2/1024}' /proc/$SCHED_PID/status 2>/dev/null || echo 0)
+    local minio_pid=$(docker inspect minio --format '{{.State.Pid}}' 2>/dev/null)
+    local minio_rss=$(awk '/VmRSS/ {printf "%d", $2/1024}' /proc/$minio_pid/status 2>/dev/null || echo 0)
+    local cpu=$(ps -p $EXEC_PID -o %cpu --no-headers 2>/dev/null | awk '{printf "%.1f", $1}')
+    echo "$exec_rss $sched_rss $minio_rss $cpu"
 }
 
-# ============================================================
-# Executor 启动
-# ============================================================
-start_executors() {
-    local n=$1; local label=$2; local ports="$3"
-
-    ok "启动 $n 个 Executor (各 $CONCURRENT 并发, 总并发 $TOTAL_TASKS)..."
-    for i in $(seq 1 $n); do
-        local flight=$((50050 + i * 2 - 1))
-        local grpc=$((50050 + i * 2))
-        "$EXEC" -p $flight --bind-grpc-port $grpc -c $CONCURRENT > /tmp/exec_${label}_${i}.log 2>&1 &
+ok "=== 开始监控 ==="
+(   echo "#ts exec_rss_mb sched_rss_mb minio_rss_mb exec_cpu_pct"
+    while kill -0 $EXEC_PID 2>/dev/null; do
+        TS=$(date +%H:%M:%S)
+        echo "$TS $(get_rss_all)"
+        sleep 1
     done
-    sleep $((4 + n * 2))
+) > "$OUTDIR/monitor.csv" &
+MON_PID=$!
+sleep 1
 
-    assert_ports "Executor" $ports
-}
-
-# ============================================================
-# 压测 + 运行中监控
-# ============================================================
-run_bench() {
-    local label=$1; shift; local ports="$@"
-    local logfile="/tmp/bench_${label}.log"
-
-    ok "===== 开始压测: $label ====="
-    ok "  配置: ${N_EXEC} Executor × ${CONCURRENT} 并发, ${REGIONS} regions, ${JSON_SIZE}B JSON"
-
-    # 后台进程监控
-    (
-        local start=$(date +%s)
-        while true; do
-            sleep 2
-            local dead=""; local alive=0
-            for port in $ports; do
-                if ss -tlnp 2>/dev/null | grep -q ":$port "; then
-                    alive=$((alive + 1))
-                else
-                    dead="$dead $port"
-                fi
-            done
-            if [ -n "$dead" ]; then
-                local elapsed=$(($(date +%s) - start))
-                fail "⚠ T+${elapsed}s Executor 端口下线:$dead (存活: $alive)"
-            fi
-        done
-    ) &
-    local mon_pid=$!
-
-    MAP_PARTITION_SO="$SO" "$BENCH" -r $REGIONS -j $JSON_SIZE 2>&1 | tee "$logfile"
-    local bench_rc=${PIPESTATUS[0]}
-
-    kill $mon_pid 2>/dev/null || true; wait $mon_pid 2>/dev/null || true
-
-    # 运行后状态
-    ok "  运行后 Executor 状态:"
-    local alive=0
-    for port in $ports; do
-        if ss -tlnp 2>/dev/null | grep -q ":$port "; then
-            alive=$((alive + 1))
-        else
-            fail "    $port ✗ 已下线"
-        fi
-    done
-    ok "  $alive/$N_EXEC 存活"
-
-    # 结果解析
-    if [[ "$bench_rc" -ne 0 ]]; then
-        fail "压测进程退出码: $bench_rc"
-        grep -i "error" "$logfile" | tail -5 || true
-        return 1
-    fi
-
-    if grep -q "无 CROSS_REGION_ERROR" "$logfile"; then
-        ok "✅ 无 CROSS_REGION_ERROR"
-    else
-        fail "❌ 检测到 CROSS_REGION_ERROR"
-    fi
-
-    local tm=$(grep "分布式计算耗时" "$logfile" | awk -F': ' '{print $2}' | tr -d 's')
-    local tp=$(grep "吞吐量" "$logfile" | awk -F': ' '{print $2}')
-    local rows=$(grep "输出行数" "$logfile" | head -1 | awk -F': ' '{print $2}')
-    ok "  耗时: ${tm}s | 吞吐量: ${tp} | 输出: ${rows} 行"
-    ok "  详细日志: $logfile"
-    echo ""
-}
+# 冷启动基线
+read -r _ baseline_exec _ baseline_sched _ baseline_minio _ < <(get_rss_all; echo)
+ok "冷启动基线: Executor=${baseline_exec}MB Scheduler=${baseline_sched}MB MinIO=${baseline_minio}MB"
 
 # ============================================================
-# 主流程
+# 压测
 # ============================================================
-main() {
-    check_binaries
-    clean_all
-    assert_clean
+ok "=== 运行压测 ==="
+ok "  参数: -n $N_TASKS (并发)  -r $REGIONS (region)  -j $JSON (JSON字节)"
+ok "  总行数: $TOTAL_ROWS  (= $REGIONS regions × 100 channels × 1000 轨迹)"
+ok "  结果目录: $OUTDIR"
 
-    local label="${N_EXEC}x${CONCURRENT}"
-    local minio_nodes=1
-    [[ $N_EXEC -ge 2 ]] && minio_nodes=4
+MAP_PARTITION_SO="$SO" "$BENCH" -r "$REGIONS" -j "$JSON" 2>&1 | tee "$OUTDIR/bench.log"
+BENCH_RC=${PIPESTATUS[0]}
 
-    ok "============================================================"
-    ok "  ${N_EXEC} Executor × ${CONCURRENT} 并发  +  ${minio_nodes} MinIO"
-    ok "  数据: ${REGIONS} regions × 4KB JSON = $((REGIONS * 100 * 1000)) 行"
-    ok "============================================================"
+# 停止监控
+kill $MON_PID 2>/dev/null || true; wait $MON_PID 2>/dev/null || true
 
-    start_minio $minio_nodes
+# ============================================================
+# 提取结果
+# ============================================================
+GEN_TIME=$(grep "数据生成+写入" "$OUTDIR/bench.log" | awk -F': ' '{print $2}' | tr -d 's')
+COMPUTE_TIME=$(grep "分布式计算耗时" "$OUTDIR/bench.log" | awk -F': ' '{print $2}' | tr -d 's')
+THROUGHPUT=$(grep "吞吐量" "$OUTDIR/bench.log" | awk -F': ' '{print $2}')
+OUTPUT_ROWS=$(grep "输出行数" "$OUTDIR/bench.log" | head -1 | awk -F': ' '{print $2}')
+CROSS_REGION=$(grep -c "无 CROSS_REGION_ERROR" "$OUTDIR/bench.log" || echo 0)
 
-    ok "启动 Scheduler..."
-    "$SCHED" > /tmp/sched_${label}.log 2>&1 &
-    sleep 3
-    assert_ports "Scheduler" 50050
+# 内存分析
+PEAK_EXEC=$(awk 'NR>1 {if($2>max)max=$2} END{print max}' "$OUTDIR/monitor.csv")
+PEAK_SCHED=$(awk 'NR>1 {if($3>max)max=$3} END{print max}' "$OUTDIR/monitor.csv")
+PEAK_MINIO=$(awk 'NR>1 {if($4>max)max=$4} END{print max}' "$OUTDIR/monitor.csv")
+PEAK_CPU=$(awk 'NR>1 {if($5+0>max)max=$5} END{print max}' "$OUTDIR/monitor.csv")
 
-    # 构建端口列表
-    local exec_ports=""
-    for i in $(seq 1 $N_EXEC); do
-        exec_ports="$exec_ports $((50050 + i * 2 - 1))"
-    done
-    start_executors $N_EXEC $label "$exec_ports"
+# 回落后的值 (最后 3 行平均)
+AFTER_EXEC=$(tail -20 "$OUTDIR/monitor.csv" | awk 'NR>1 {s+=$2;c++} END{printf "%d", s/c}')
+AFTER_SCHED=$(tail -20 "$OUTDIR/monitor.csv" | awk 'NR>1 {s+=$3;c++} END{printf "%d", s/c}')
+AFTER_MINIO=$(tail -20 "$OUTDIR/monitor.csv" | awk 'NR>1 {s+=$4;c++} END{printf "%d", s/c}')
+AFTER_CPU=$(tail -20 "$OUTDIR/monitor.csv" | awk 'NR>1 {s+=$5;c++} END{printf "%.1f", s/c}')
 
-    run_bench "$label" $exec_ports
+# ============================================================
+# 输出报告
+# ============================================================
+ok "============================================"
+ok "  压测结果"
+ok "============================================"
+cat <<EOF | tee "$OUTDIR/result.txt"
 
-    # 汇总
-    ok "========== 结果 =========="
-    printf "  %-15s %10s %12s\n" "配置" "耗时" "吞吐量"
-    local tm=$(grep "分布式计算耗时" /tmp/bench_${label}.log | awk -F': ' '{print $2}' | tr -d 's')
-    local tp=$(grep "吞吐量" /tmp/bench_${label}.log | awk -F': ' '{print $2}')
-    printf "  %-15s %10ss %12s\n" "$label" "$tm" "$tp"
-    ok "完成。"
-}
+  配置:
+    并发数:       $N_TASKS
+    Region 数:    $REGIONS
+    JSON 大小:    $JSON 字节
+    总行数:       $TOTAL_ROWS
 
-main
+  耗时:
+    数据生成+写入: ${GEN_TIME}s
+    分布式计算:    ${COMPUTE_TIME}s
+    吞吐量:        $THROUGHPUT
+
+  内存 (RSS):
+    ┌──────────┬──────────┬──────────┬──────────┐
+    │ 进程     │ 冷启动   │ 峰值     │ 回落     │
+    ├──────────┼──────────┼──────────┼──────────┤
+    │ Executor │ ${baseline_exec} MB    │ ${PEAK_EXEC} MB     │ ${AFTER_EXEC} MB     │
+    │ Scheduler│ ${baseline_sched} MB    │ ${PEAK_SCHED} MB     │ ${AFTER_SCHED} MB     │
+    │ MinIO    │ ${baseline_minio} MB    │ ${PEAK_MINIO} MB     │ ${AFTER_MINIO} MB     │
+    └──────────┴──────────┴──────────┴──────────┘
+
+  Executor CPU 峰值: ${PEAK_CPU}%   回落: ${AFTER_CPU}%
+
+  输出: ${OUTPUT_ROWS} 行  |  正确性: $([[ $CROSS_REGION -ge 1 ]] && echo "✅ 无 CROSS_REGION_ERROR" || echo "❌ 异常")
+EOF
+
+ok "完整数据: $OUTDIR"
+
+[[ "$BENCH_RC" -eq 0 ]] || exit 1
