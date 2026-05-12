@@ -23,6 +23,8 @@ use map_partition_sdk::{PartitionProcessor, export_partition_processor};
 struct RegionClusterProcessor {
     /// Input schema (used for FFI record batch decoding)
     input_schema: SchemaRef,
+    /// The partition ID this processor is running on
+    partition_id: usize,
     /// channelid -> list of (recordid, json)
     clusters: HashMap<String, Vec<(String, String)>>,
     /// The region value seen so far (first non-null region)
@@ -88,9 +90,10 @@ fn sample_jsons(recs: &[(String, String)]) -> (String, String, String, String) {
 }
 
 impl PartitionProcessor for RegionClusterProcessor {
-    fn new(schema: SchemaRef) -> Self {
+    fn new(schema: SchemaRef, partition_id: usize) -> Self {
         Self {
             input_schema: schema,
+            partition_id,
             clusters: HashMap::new(),
             observed_region: None,
             cross_region_error: false,
@@ -101,6 +104,10 @@ impl PartitionProcessor for RegionClusterProcessor {
 
     fn schema(&self) -> &SchemaRef {
         &self.input_schema
+    }
+
+    fn partition_id(&self) -> usize {
+        self.partition_id
     }
 
     fn feed(&mut self, batch: RecordBatch) {
@@ -256,7 +263,7 @@ mod tests {
     #[test]
     fn test_single_region_single_channel() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(
             vec!["east", "east"],
             vec!["ch001", "ch001"],
@@ -273,7 +280,7 @@ mod tests {
     #[test]
     fn test_single_region_multiple_channels() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(
             vec!["east", "east", "east"],
             vec!["ch001", "ch001", "ch002"],
@@ -290,7 +297,7 @@ mod tests {
     #[test]
     fn test_cross_region_detection() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(
             vec!["east", "west"],
             vec!["ch001", "ch002"],
@@ -304,7 +311,7 @@ mod tests {
     #[test]
     fn test_execute_clusters_by_channel() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(
             vec!["east", "east", "east"],
             vec!["ch001", "ch001", "ch002"],
@@ -333,7 +340,7 @@ mod tests {
     #[test]
     fn test_execute_cross_region_includes_error() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(
             vec!["east", "west"],
             vec!["ch001", "ch002"],
@@ -348,7 +355,7 @@ mod tests {
     #[test]
     fn test_fetch_returns_batch() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(
             vec!["north", "north"],
             vec!["ch001", "ch001"],
@@ -365,7 +372,7 @@ mod tests {
     #[test]
     fn test_fetch_returns_none_when_exhausted() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(
             vec!["east"],
             vec!["ch001"],
@@ -381,7 +388,7 @@ mod tests {
     #[test]
     fn test_empty_batch() {
         let schema = create_test_schema();
-        let mut processor = RegionClusterProcessor::new(schema);
+        let mut processor = RegionClusterProcessor::new(schema, 0);
         let batch = create_record_batch(vec![] as Vec<&str>, vec![] as Vec<&str>, vec![] as Vec<&str>);
         processor.feed(batch);
 

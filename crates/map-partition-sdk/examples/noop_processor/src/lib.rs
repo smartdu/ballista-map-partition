@@ -8,15 +8,20 @@ use map_partition_sdk::{PartitionProcessor, export_partition_processor};
 /// Output schema matches region_cluster_processor: (region, dossierid, recordids, json1..4)
 struct NoopProcessor {
     input_schema: SchemaRef,
+    partition_id: usize,
 }
 
 impl PartitionProcessor for NoopProcessor {
-    fn new(schema: SchemaRef) -> Self {
-        Self { input_schema: schema }
+    fn new(schema: SchemaRef, partition_id: usize) -> Self {
+        Self { input_schema: schema, partition_id }
     }
 
     fn schema(&self) -> &SchemaRef {
         &self.input_schema
+    }
+
+    fn partition_id(&self) -> usize {
+        self.partition_id
     }
 
     fn feed(&mut self, _batch: RecordBatch) {
@@ -72,7 +77,7 @@ mod tests {
     #[test]
     fn test_feed_discards_all() {
         let schema = create_input_batch().schema();
-        let mut processor = NoopProcessor::new(schema);
+        let mut processor = NoopProcessor::new(schema, 0);
         let batch = create_input_batch();
         processor.feed(batch);
         // no panic = success
@@ -81,7 +86,7 @@ mod tests {
     #[test]
     fn test_execute_noop() {
         let schema = create_input_batch().schema();
-        let mut processor = NoopProcessor::new(schema);
+        let mut processor = NoopProcessor::new(schema, 0);
         processor.execute();
         // no panic = success
     }
@@ -89,14 +94,14 @@ mod tests {
     #[test]
     fn test_fetch_always_none() {
         let schema = create_input_batch().schema();
-        let mut processor = NoopProcessor::new(schema);
+        let mut processor = NoopProcessor::new(schema, 0);
         assert!(processor.fetch().is_none());
     }
 
     #[test]
     fn test_empty_input() {
         let schema = create_input_batch().schema();
-        let mut processor = NoopProcessor::new(schema.clone());
+        let mut processor = NoopProcessor::new(schema.clone(), 0);
         let batch = RecordBatch::new_empty(schema);
         processor.feed(batch);
         processor.execute();

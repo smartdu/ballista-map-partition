@@ -68,13 +68,14 @@ df.map_partition("/path/to/lib.so", "my_processor", Arc::new(output_schema))?
 │ (一次)    │    │ (多次)    │    │ (一次)    │    │ (多次)    │    │ (一次)    │
 └──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
      │               │               │               │               │
-  传入 schema    传入 batch      执行业务逻辑    取出 batch       释放资源
-  返回 ctx       (流式输入)                     (流式输出)
+  传入 schema      传入 batch      执行业务逻辑    取出 batch       释放资源
+  + partition_id   (流式输入)                     (流式输出)
+  返回 ctx
 ```
 
 | 阶段 | 签名 | 说明 |
 |------|------|------|
-| init | `fn(schema_ptr, len) -> *mut c_void` | Schema: IPC 编码 |
+| init | `fn(schema_ptr, len, partition_id) -> *mut c_void` | Schema: IPC 编码，传入分区 ID |
 | feed | `fn(ctx, *mut FFI_ArrowArray) -> i32` | Batch: C Data Interface 零拷贝 |
 | execute | `fn(ctx) -> i32` | 所有输入完成后调用 |
 | fetch | `fn(ctx, *mut FFI_ArrowArray) -> i32` | 0=还有数据, 1=结束 |
@@ -83,8 +84,8 @@ df.map_partition("/path/to/lib.so", "my_processor", Arc::new(output_schema))?
 ### C ABI 接口
 
 ```c
-// 初始化：Schema 通过 IPC 二进制传入
-void* <fn>_init(const uint8_t* schema_ptr, int64_t schema_len);
+// 初始化：Schema 通过 IPC 二进制传入，partition_id 标识当前分区
+void* <fn>_init(const uint8_t* schema_ptr, int64_t schema_len, int64_t partition_id);
 
 // 流式输入：框架通过 to_ffi 导出，SDK 通过 from_ffi_and_data_type 导入
 int32_t <fn>_feed(void* ctx, FFI_ArrowArray* array);
@@ -340,8 +341,9 @@ plan.transform_up(&|node| {
 
 ```rust
 pub trait PartitionProcessor: Send + Sized + 'static {
-    fn new(schema: SchemaRef) -> Self;
+    fn new(schema: SchemaRef, partition_id: usize) -> Self;
     fn schema(&self) -> &SchemaRef;              // 供 _feed 构造 DataType
+    fn partition_id(&self) -> usize;             // 当前分区 ID
     fn feed(&mut self, batch: RecordBatch);       // 流式输入
     fn execute(&mut self);                        // 计算
     fn fetch(&mut self) -> Option<RecordBatch>;   // 流式输出
@@ -360,7 +362,7 @@ export_partition_processor!(MyProcessor, my_processor);
 
 | 函数 | 数据格式 |
 |------|---------|
-| `_init` | Schema: IPC bytes |
+| `_init` | Schema: IPC bytes + partition_id |
 | `_feed` | Batch: C Data Interface (FFI_ArrowArray) |
 | `_execute` | — |
 | `_fetch` | Batch: C Data Interface (FFI_ArrowArray) |

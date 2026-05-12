@@ -9,7 +9,7 @@
 /// ```
 ///
 /// This generates the following exported functions:
-/// - `my_processor_init` — partition initialization
+/// - `my_processor_init` — partition initialization (receives partition_id)
 /// - `my_processor_feed` — streaming input
 /// - `my_processor_execute` — execute business logic
 /// - `my_processor_fetch` — streaming output
@@ -22,6 +22,7 @@ macro_rules! export_partition_processor {
             pub extern "C" fn [<$fn_name _init>](
                 schema_ptr: *const u8,
                 schema_len: i64,
+                partition_id: i64,
             ) -> *mut std::ffi::c_void {
                 let schema_bytes =
                     unsafe { std::slice::from_raw_parts(schema_ptr, schema_len as usize) };
@@ -32,7 +33,7 @@ macro_rules! export_partition_processor {
                         return std::ptr::null_mut();
                     }
                 };
-                let processor = <$processor_type as $crate::PartitionProcessor>::new(schema);
+                let processor = <$processor_type as $crate::PartitionProcessor>::new(schema, partition_id as usize);
                 Box::into_raw(Box::new(processor)) as *mut std::ffi::c_void
             }
 

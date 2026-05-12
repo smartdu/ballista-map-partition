@@ -295,7 +295,7 @@ impl ExecutionPlan for MapPartitionExec {
                 // Get _init symbol
                 let init_name = format!("{fn_name}_init");
                 let init_func: libloading::Symbol<
-                    unsafe extern "C" fn(*const u8, i64) -> *mut std::ffi::c_void,
+                    unsafe extern "C" fn(*const u8, i64, i64) -> *mut std::ffi::c_void,
                 > = unsafe {
                     lib.get(init_name.as_bytes()).map_err(|e| {
                         DataFusionError::Internal(format!("symbol {init_name} not found: {e}"))
@@ -356,7 +356,7 @@ impl ExecutionPlan for MapPartitionExec {
                         // Lazy init: create processor on first encounter of this key
                         if !processors.contains_key(&key) {
                             let raw_ctx = unsafe {
-                                init_func(input_schema_bytes.as_ptr(), input_schema_bytes.len() as i64)
+                                init_func(input_schema_bytes.as_ptr(), input_schema_bytes.len() as i64, partition as i64)
                             };
 
                             processors.insert(key.clone(), GroupProcessor {
@@ -449,7 +449,7 @@ impl ExecutionPlan for MapPartitionExec {
                 // ---- Phase 2: _init ----
                 let init_name = format!("{fn_name}_init");
                 let init_func: libloading::Symbol<
-                    unsafe extern "C" fn(*const u8, i64) -> *mut std::ffi::c_void,
+                    unsafe extern "C" fn(*const u8, i64, i64) -> *mut std::ffi::c_void,
                 > = unsafe {
                     lib.get(init_name.as_bytes()).map_err(|e| {
                         DataFusionError::Internal(format!("symbol {init_name} not found: {e}"))
@@ -458,7 +458,7 @@ impl ExecutionPlan for MapPartitionExec {
 
                 let input_schema_bytes = encode_schema_to_ipc(input_stream.schema().as_ref())?;
                 let raw_ctx = unsafe {
-                    init_func(input_schema_bytes.as_ptr(), input_schema_bytes.len() as i64)
+                    init_func(input_schema_bytes.as_ptr(), input_schema_bytes.len() as i64, partition as i64)
                 };
                 let so_ctx = SoContext { ctx: raw_ctx };
 

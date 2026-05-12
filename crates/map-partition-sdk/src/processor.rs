@@ -4,7 +4,7 @@ use arrow::record_batch::RecordBatch;
 /// User-implemented trait for defining partition processing logic.
 ///
 /// The lifecycle is:
-/// 1. `new(schema)` — called once at partition start
+/// 1. `new(schema, partition_id)` — called once at partition start
 /// 2. `feed(batch)` — called multiple times, streaming input
 /// 3. `execute()` — called once after all input is fed
 /// 4. `fetch()` — called multiple times, streaming output
@@ -14,11 +14,14 @@ use arrow::record_batch::RecordBatch;
 /// If you need to retain data, clone it or store it in your struct.
 pub trait PartitionProcessor: Send + Sized + 'static {
     /// Called once at the start of each partition.
-    /// Receives the input schema so you can prepare accordingly.
-    fn new(schema: SchemaRef) -> Self;
+    /// Receives the input schema and partition ID for contextual awareness.
+    fn new(schema: SchemaRef, partition_id: usize) -> Self;
 
     /// Returns the input schema. Used by the framework to decode FFI arrays.
     fn schema(&self) -> &SchemaRef;
+
+    /// Returns the partition ID this processor is running on.
+    fn partition_id(&self) -> usize;
 
     /// Stream input data. Called once per RecordBatch in the partition.
     /// The framework releases the batch after this call returns.
