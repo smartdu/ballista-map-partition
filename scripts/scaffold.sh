@@ -284,7 +284,7 @@ async fn main() -> datafusion::common::Result<()> {
 
     // Clean + write
     {
-        let s3_url = url::Url::parse("s3://ballista/demo_data/")
+        let s3_url = url::Url::parse(&format!("s3://{S3_BUCKET}/demo_data/"))
             .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         let store = local_ctx.runtime_env().object_store_registry.get_store(&s3_url)?;
         let prefix = object_store::path::Path::from("demo_data");
@@ -297,8 +297,8 @@ async fn main() -> datafusion::common::Result<()> {
     local_ctx.deregister_table("demo")?;
     local_ctx.register_batch("demo", batch)?;
     let df = local_ctx.sql("SELECT * FROM demo").await?;
-    let s3_path = "s3://ballista/demo_data/";
-    df.write_parquet(s3_path, Default::default(), None).await?;
+    let s3_path = format!("s3://{S3_BUCKET}/demo_data/");
+    df.write_parquet(&s3_path, Default::default(), None).await?;
     println!("[OK] 写入测试数据到 {s3_path}");
 
     // ---- 2. Ballista remote context ----
@@ -316,7 +316,7 @@ async fn main() -> datafusion::common::Result<()> {
     ctx.sql(&format!("SET s3.endpoint = '{S3_ENDPOINT}'")).await?.show().await?;
 
     // ---- 3. Run processor ----
-    let df = ctx.read_parquet(s3_path, Default::default()).await?;
+    let df = ctx.read_parquet(&s3_path, Default::default()).await?;
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("partition_id", DataType::UInt64, false),
         Field::new("status", DataType::Utf8, false),
