@@ -46,6 +46,35 @@ cargo build --release -p noop_processor
 cargo build --release --examples
 ```
 
+### 项目脚手架
+
+一键生成独立项目（processor + client），与框架源码隔离：
+
+```bash
+# 同时生成 processor (.so) + client (binary)
+./scripts/scaffold.sh /path/to/my-project
+
+# 仅生成 processor
+./scripts/scaffold.sh -p /path/to/my-project
+
+# 仅生成 client
+./scripts/scaffold.sh -c /path/to/my-project
+```
+
+生成后即可构建和测试：
+
+```bash
+cd /path/to/my-project
+cargo test -p my-project_processor           # 跑 processor 单元测试
+cargo build --release -p my-project_processor # 构建 .so
+
+MAP_PARTITION_SO=target/release/libmy-project_processor.so \
+MAP_PARTITION_FN=my_project_processor \
+  cargo run --release -p my-project_client
+```
+
+模板包含完整的 `PartitionProcessor` 实现骨架、单元测试、client 数据生成→S3→DistributeBy 全流程。
+
 ### 示例
 
 | 类别 | 示例 | 说明 |
