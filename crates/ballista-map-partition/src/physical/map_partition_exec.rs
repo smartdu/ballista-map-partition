@@ -37,18 +37,35 @@ pub fn encode_schema_to_ipc(schema: &Schema) -> Result<Vec<u8>, DataFusionError>
 /// not by the .so. This breaks the dependency on the .so's FFI_ArrowArray release
 /// callback, which would otherwise crash if the .so is unloaded before the batch
 /// is dropped by the downstream operator.
+///
+/// Uses IPC round-trip to force all buffers into framework-owned allocations.
+/// This handles all Arrow data types generically.
 fn deep_copy_batch(batch: &RecordBatch) -> Result<RecordBatch, DataFusionError> {
-    use datafusion::arrow::array::StringArray;
-    use datafusion::arrow::array::ArrayRef;
-    let schema = batch.schema();
-    let cols: Vec<ArrayRef> = batch.columns().iter().map(|c| {
-        let arr = c.as_any().downcast_ref::<StringArray>().expect("output columns must be Utf8");
-        let vals: StringArray = (0..arr.len()).map(|i| {
-            if arr.is_null(i) { None } else { Some(arr.value(i)) }
-        }).collect();
-        Arc::new(vals) as ArrayRef
-    }).collect();
-    Ok(RecordBatch::try_new(schema, cols).map_err(|e| DataFusionError::Internal(format!("deep copy: {e}")))?)
+    use datafusion::arrow::ipc::reader::StreamReader;
+    use datafusion::arrow::ipc::writer::StreamWriter;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, batch.schema().as_ref())
+            .map_err(|e| DataFusionError::Internal(format!("deep copy writer: {e}")))?;
+        writer
+            .write(batch)
+            .map_err(|e| DataFusionError::Internal(format!("deep copy write: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| DataFusionError::Internal(format!("deep copy finish: {e}")))?;
+        // writer dropped here — flushes
+    }
+
+    let cursor = std::io::Cursor::new(&buf);
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| DataFusionError::Internal(format!("deep copy reader: {e}")))?;
+    let mut batches: Vec<RecordBatch> = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| DataFusionError::Internal(format!("deep copy read: {e}")))?;
+    batches
+        .pop()
+        .ok_or(DataFusionError::Internal("deep copy: empty stream".to_string()))
 }
 
 /// Wrapper to make raw pointers Send-safe within our spawned task.

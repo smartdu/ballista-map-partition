@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, BooleanArray, Float64Array, Int32Array, Int64Array, StringArray, TimestampNanosecondArray};
 use arrow::compute::CastOptions;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 
 use map_partition_sdk::{PartitionProcessor, export_partition_processor};
@@ -189,8 +189,14 @@ impl PartitionProcessor for RegionClusterProcessor {
             Field::new("json2", DataType::Utf8, false),
             Field::new("json3", DataType::Utf8, false),
             Field::new("json4", DataType::Utf8, false),
+            Field::new("test_int32", DataType::Int32, false),
+            Field::new("test_int64", DataType::Int64, false),
+            Field::new("test_float64", DataType::Float64, false),
+            Field::new("test_ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+            Field::new("test_bool", DataType::Boolean, false),
         ]));
 
+        let n = self.output_rows.len();
         let regions: StringArray = self.output_rows.iter().map(|r| Some(r.region.as_str())).collect();
         let dossierids: StringArray = self.output_rows.iter().map(|r| Some(r.dossierid.as_str())).collect();
         let recordids: StringArray = self.output_rows.iter().map(|r| Some(r.recordids.as_str())).collect();
@@ -198,6 +204,12 @@ impl PartitionProcessor for RegionClusterProcessor {
         let json2s: StringArray = self.output_rows.iter().map(|r| Some(r.json2.as_str())).collect();
         let json3s: StringArray = self.output_rows.iter().map(|r| Some(r.json3.as_str())).collect();
         let json4s: StringArray = self.output_rows.iter().map(|r| Some(r.json4.as_str())).collect();
+
+        let test_int32: Int32Array = vec![42i32; n].into_iter().map(Some).collect();
+        let test_int64: Int64Array = vec![0i64; n].into_iter().map(Some).collect();
+        let test_float64: Float64Array = vec![std::f64::consts::PI; n].into_iter().map(Some).collect();
+        let test_ts: TimestampNanosecondArray = vec![0i64; n].into_iter().map(Some).collect();
+        let test_bool: BooleanArray = vec![true; n].into_iter().map(Some).collect();
 
         self.output_index = self.output_rows.len();
 
@@ -212,6 +224,11 @@ impl PartitionProcessor for RegionClusterProcessor {
                     Arc::new(json2s),
                     Arc::new(json3s),
                     Arc::new(json4s),
+                    Arc::new(test_int32),
+                    Arc::new(test_int64),
+                    Arc::new(test_float64),
+                    Arc::new(test_ts),
+                    Arc::new(test_bool),
                 ],
             )
             .expect("failed to create output batch"),
@@ -366,7 +383,7 @@ mod tests {
 
         let output = processor.fetch().unwrap();
         assert_eq!(output.num_rows(), 1); // 1 cluster for ch001
-        assert_eq!(output.schema().fields().len(), 7);
+        assert_eq!(output.schema().fields().len(), 12);
     }
 
     #[test]

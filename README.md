@@ -88,7 +88,7 @@ MAP_PARTITION_FN=my_project_processor \
 
 | 处理器 | 说明 |
 |--------|------|
-| `region_cluster_processor` | 按 channelid 聚类生成 dossier，检测 CROSS_REGION_ERROR |
+| `region_cluster_processor` | 按 channelid 聚类生成 dossier，检测 CROSS_REGION_ERROR；输出含 Int32/Int64/Float64/Timestamp/Boolean 测试列 |
 | `noop_processor` | 空处理器，丢弃所有输入不产生输出 — 用于压测框架开销 |
 
 ### DistributeBy API

@@ -8,7 +8,7 @@ use ballista_map_partition::codec::extension::{
 };
 use ballista_map_partition::dataframe::map_partition::DataFrameExt;
 use datafusion::arrow::array::{Array, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionContext, col};
 use futures::StreamExt;
@@ -253,6 +253,11 @@ async fn main() -> datafusion::common::Result<()> {
         Field::new("json2", DataType::Utf8, false),
         Field::new("json3", DataType::Utf8, false),
         Field::new("json4", DataType::Utf8, false),
+        Field::new("test_int32", DataType::Int32, false),
+        Field::new("test_int64", DataType::Int64, false),
+        Field::new("test_float64", DataType::Float64, false),
+        Field::new("test_ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("test_bool", DataType::Boolean, false),
     ]));
 
     let so_path = std::env::var("MAP_PARTITION_SO")

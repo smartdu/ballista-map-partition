@@ -6,7 +6,7 @@ use ballista_map_partition::codec::extension::{
     ExtendedBallistaLogicalCodec, ExtendedBallistaPhysicalCodec,
 };
 use ballista_map_partition::dataframe::map_partition::DataFrameExt;
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionContext, col};
 
@@ -91,7 +91,7 @@ async fn main() -> datafusion::common::Result<()> {
     println!("--- Input: region face capture data ---");
     df.clone().show().await?;
 
-    // 输出 schema: (region, dossierid, recordids, json1, json2, json3, json4)
+    // 输出 schema: (region, dossierid, recordids, json1, json2, json3, json4) + 5 test types
     let output_schema = Arc::new(Schema::new(vec![
         Field::new("region", DataType::Utf8, false),
         Field::new("dossierid", DataType::Utf8, false),
@@ -100,6 +100,11 @@ async fn main() -> datafusion::common::Result<()> {
         Field::new("json2", DataType::Utf8, false),
         Field::new("json3", DataType::Utf8, false),
         Field::new("json4", DataType::Utf8, false),
+        Field::new("test_int32", DataType::Int32, false),
+        Field::new("test_int64", DataType::Int64, false),
+        Field::new("test_float64", DataType::Float64, false),
+        Field::new("test_ts", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("test_bool", DataType::Boolean, false),
     ]));
 
     let so_path = std::env::var("MAP_PARTITION_SO")
