@@ -4,3 +4,5 @@ data/*
 !data/face_capture/
 !data/region_face_capture/
 target/
+core.*
+core.*

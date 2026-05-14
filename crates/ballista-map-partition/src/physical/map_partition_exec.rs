@@ -183,6 +183,8 @@ pub struct MapPartitionExec {
     pub num_partitions: usize,
     /// Internal: derived hash partition info for RepartitionExec
     pub hash_partition: Option<(Vec<Arc<dyn PhysicalExpr>>, usize)>,
+    /// Cached dlopen handle — shared across all partition tasks
+    cached_lib: std::sync::OnceLock<Arc<libloading::Library>>,
     cache: PlanProperties,
 }
 
@@ -205,6 +207,7 @@ impl MapPartitionExec {
             distribute_by,
             num_partitions,
             hash_partition,
+            cached_lib: std::sync::OnceLock::new(),
             cache,
         }
     }
@@ -280,6 +283,7 @@ impl ExecutionPlan for MapPartitionExec {
             distribute_by: self.distribute_by.clone(),
             num_partitions: self.num_partitions,
             hash_partition: self.hash_partition.clone(),
+            cached_lib: std::sync::OnceLock::new(),
             cache,
         }))
     }
@@ -295,16 +299,20 @@ impl ExecutionPlan for MapPartitionExec {
         let output_schema = self.output_schema.clone();
         let distribute_by = self.distribute_by.clone();
 
+        // Cache dlopen across partitions: first call loads, subsequent calls clone Arc
+        let lib = self.cached_lib.get_or_init(|| {
+            Arc::new(unsafe {
+                libloading::Library::new(&so_path)
+                    .expect("failed to dlopen map_partition .so")
+            })
+        }).clone();
+
         let mut builder = RecordBatchReceiverStreamBuilder::new(output_schema.clone(), 4);
         let tx = builder.tx();
 
         builder.spawn(async move {
-            // ---- Phase 1: dlopen .so ----
-            let lib = unsafe {
-                libloading::Library::new(&so_path).map_err(|e| {
-                    DataFusionError::Internal(format!("failed to load {so_path}: {e}"))
-                })?
-            };
+            // lib (Arc<Library>) is used for all symbol lookups below;
+            // it stays alive until this async block completes
 
             if let Some(ref key_expr) = distribute_by {
                 // ===== DistributeBy mode: group by key =====
