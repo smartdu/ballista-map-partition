@@ -2,8 +2,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::arrow::array::{BooleanArray, Array, StructArray};
-use datafusion::arrow::compute::filter_record_batch;
+use datafusion::arrow::array::{Array, StructArray};
 use datafusion::arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion::arrow::ffi::{FFI_ArrowArray, from_ffi_and_data_type, to_ffi};
 use datafusion::arrow::ipc::writer::StreamWriter;
@@ -84,45 +83,49 @@ struct GroupProcessor {
 
 /// Split a RecordBatch into sub-batches grouped by the distribute_by key.
 /// Returns a Vec of (key_value, sub_batch) pairs, preserving key order.
+///
+/// Single-pass algorithm: indexes rows into HashMap<Key, Vec<usize>>,
+/// then uses arrow::compute::take for vectorized sub-batch extraction.
 fn split_batch_by_key(
     batch: &RecordBatch,
     key_expr: &Arc<dyn PhysicalExpr>,
 ) -> Result<Vec<(ScalarValue, RecordBatch)>, DataFusionError> {
+    use datafusion::arrow::array::UInt64Array;
+    use datafusion::arrow::compute::take;
+    use std::collections::HashMap;
+
     let key_value = key_expr.evaluate(batch)?;
     let key_array = key_value.into_array(batch.num_rows())?;
 
-    // Collect unique key values in order of appearance using ScalarValue (avoids arrow version conflicts)
-    let mut seen_keys: Vec<ScalarValue> = Vec::new();
-    let mut key_set: std::collections::HashSet<ScalarValue> = std::collections::HashSet::new();
+    // Single pass: group row indices by key value
+    let mut groups: HashMap<ScalarValue, Vec<usize>> = HashMap::new();
+    let mut key_order: Vec<ScalarValue> = Vec::new();
 
     for i in 0..key_array.len() {
         if key_array.is_null(i) {
             continue;
         }
         let sv = ScalarValue::try_from_array(&key_array, i)?;
-        if key_set.insert(sv.clone()) {
-            seen_keys.push(sv);
+        if let std::collections::hash_map::Entry::Vacant(e) = groups.entry(sv.clone()) {
+            key_order.push(sv);
+            e.insert(vec![i]);
+        } else {
+            groups.get_mut(&sv).unwrap().push(i);
         }
     }
 
-    // Build a boolean filter for each key and split the batch
-    let mut result = Vec::with_capacity(seen_keys.len());
-    for key in &seen_keys {
-        let filter: BooleanArray = (0..key_array.len())
-            .map(|i| {
-                if key_array.is_null(i) {
-                    false
-                } else {
-                    let sv = ScalarValue::try_from_array(&key_array, i).unwrap();
-                    &sv == key
-                }
-            })
-            .collect();
-
-        let sub_batch = filter_record_batch(batch, &filter)?;
-        if sub_batch.num_rows() > 0 {
-            result.push((key.clone(), sub_batch));
-        }
+    // Extract sub-batches via take on each column
+    let mut result = Vec::with_capacity(key_order.len());
+    for key in key_order {
+        let indices = groups.remove(&key).unwrap();
+        let take_indices = UInt64Array::from(indices.iter().map(|&i| i as u64).collect::<Vec<_>>());
+        let cols: Vec<_> = batch.columns().iter().map(|c| {
+            take(c.as_ref(), &take_indices, None)
+                .map_err(|e| DataFusionError::Internal(format!("take: {e}")))
+        }).collect::<Result<_, _>>()?;
+        let sub_batch = RecordBatch::try_new(batch.schema(), cols)
+            .map_err(|e| DataFusionError::Internal(format!("split_batch_by_key: {e}")))?;
+        result.push((key, sub_batch));
     }
 
     Ok(result)
